@@ -1,0 +1,167 @@
+package com.android.everytalk.data.network
+
+import android.util.Log
+import com.android.everytalk.config.PerformanceConfig
+import io.ktor.client.plugins.*
+import io.ktor.client.request.*
+import io.ktor.http.*
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.intOrNull
+import kotlinx.serialization.json.jsonPrimitive
+
+/**
+ * 错误处理结果，包含 Error 事件和 Finish 事件
+ */
+data class ErrorWithFinish(
+    val error: AppStreamEvent.Error,
+    val finish: AppStreamEvent.Finish
+)
+
+object NetworkUtils {
+    private const val TAG = "NetworkUtils"
+
+    private val SENSITIVE_PARAM_REGEX = Regex(
+        """([?&])(key|token|api[_-]?key|secret|password|authorization)=[^&\]\s]*""",
+        RegexOption.IGNORE_CASE
+    )
+
+    fun sanitizeMessage(raw: String?): String {
+        if (raw.isNullOrBlank()) return "未知错误"
+        return SENSITIVE_PARAM_REGEX.replace(raw) { match ->
+            "${match.groupValues[1]}${match.groupValues[2]}=***"
+        }
+    }
+    
+    fun HttpRequestBuilder.configureSSERequest() {
+        accept(ContentType.Text.EventStream)
+        header(HttpHeaders.Accept, "text/event-stream")
+        header(HttpHeaders.AcceptEncoding, "identity")
+        header(HttpHeaders.CacheControl, "no-cache, no-store, max-age=0, must-revalidate")
+        header(HttpHeaders.Pragma, "no-cache")
+        header(HttpHeaders.Connection, "keep-alive")
+        header("X-Accel-Buffering", "no")
+        header(
+            HttpHeaders.UserAgent,
+            "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36"
+        )
+        
+        timeout {
+            requestTimeoutMillis = PerformanceConfig.NETWORK_SSE_REQUEST_TIMEOUT_MS
+            connectTimeoutMillis = PerformanceConfig.NETWORK_CONNECT_TIMEOUT_MS
+            socketTimeoutMillis = PerformanceConfig.NETWORK_SSE_SOCKET_TIMEOUT_MS
+        }
+    }
+    
+    suspend fun handleApiError(
+        statusCode: HttpStatusCode,
+        errorBody: String?,
+        apiName: String
+    ): ErrorWithFinish {
+        val body = errorBody ?: "(no body)"
+        Log.e(TAG, "$apiName API 错误 $statusCode: bodyChars=${body.length}")
+        val upstream = parseProviderErrorBody(body)
+        val retryable = statusCode.value in setOf(408, 409, 425, 429) || statusCode.value in 500..599
+        
+        val errorMessage = when {
+            statusCode.value == 401 -> "$apiName: API 密钥无效或已过期"
+            statusCode.value == 403 -> "$apiName: 访问被拒绝，请检查 API 权限"
+            statusCode.value == 429 -> "$apiName: 请求过于频繁，请稍后重试"
+            statusCode.value in listOf(500, 502, 503, 504) -> "$apiName: 服务器暂时不可用，请稍后重试"
+            statusCode.value == 400 && body.contains("image_url") -> "$apiName: 该模型不支持图像识别，请切换支持视觉的模型"
+            else -> "$apiName API 错误: $statusCode"
+        }
+        
+        return ErrorWithFinish(
+            AppStreamEvent.Error(
+                message = errorMessage,
+                upstreamStatus = statusCode.value,
+                code = upstream.code,
+                // 临时 HTTP 错误必须进入 AgentRun 恢复链路，不能永久标记为执行失败。
+                type = if (retryable) "retryable_network" else upstream.type,
+                parameter = upstream.parameter,
+                rawMessage = upstream.message,
+                maxContextTokens = upstream.maxContextTokens,
+                maxOutputTokens = upstream.maxOutputTokens,
+            ),
+            AppStreamEvent.Finish("api_error")
+        )
+    }
+    
+    fun handleConnectionError(
+        exception: Exception,
+        apiName: String
+    ): ErrorWithFinish {
+        Log.e(TAG, "$apiName 连接失败", exception)
+
+        val isAborted = exception is java.net.SocketException &&
+            exception.message?.contains("Software caused connection abort", ignoreCase = true) == true
+
+        val (errorCode, errorType) = when {
+            isAborted -> "connection_aborted" to "retryable_network"
+            exception is java.net.SocketTimeoutException -> "connection_timeout" to "retryable_network"
+            exception is java.net.UnknownHostException -> "unknown_host" to "retryable_network"
+            exception is java.net.ConnectException -> "connection_refused" to "retryable_network"
+            exception is java.net.SocketException -> "socket_error" to "retryable_network"
+            else -> null to null
+        }
+
+        val errorMessage = when {
+            isAborted -> "$apiName 连接中断: Software caused connection abort"
+            exception is java.net.UnknownHostException -> "$apiName: 无法连接服务器，请检查网络"
+            exception is java.net.SocketTimeoutException -> "$apiName: 连接超时，请检查网络"
+            exception is javax.net.ssl.SSLException -> "$apiName: SSL 连接失败，请检查网络安全设置"
+            else -> "$apiName 连接失败: ${sanitizeMessage(exception.message)}"
+        }
+
+        return ErrorWithFinish(
+            AppStreamEvent.Error(
+                message = errorMessage,
+                upstreamStatus = null,
+                code = errorCode,
+                type = errorType,
+            ),
+            AppStreamEvent.Finish("connection_failed")
+        )
+    }
+
+    private fun parseProviderErrorBody(body: String): ParsedProviderError {
+        val root = runCatching { Json.parseToJsonElement(body) as? JsonObject }.getOrNull()
+            ?: return ParsedProviderError()
+        val error = root["error"] as? JsonObject ?: root
+        fun stringValue(vararg keys: String): String? = keys.firstNotNullOfOrNull { key ->
+            runCatching { error[key]?.jsonPrimitive?.contentOrNull }.getOrNull()
+                ?: runCatching { root[key]?.jsonPrimitive?.contentOrNull }.getOrNull()
+        }
+        fun intValue(vararg keys: String): Int? = keys.firstNotNullOfOrNull { key ->
+            runCatching { error[key]?.jsonPrimitive?.intOrNull }.getOrNull()
+                ?: runCatching { root[key]?.jsonPrimitive?.intOrNull }.getOrNull()
+        }
+        return ParsedProviderError(
+            message = stringValue("message", "detail"),
+            code = stringValue("code", "error_code"),
+            type = stringValue("type", "status"),
+            parameter = stringValue("param", "parameter"),
+            maxContextTokens = intValue(
+                "max_context_tokens",
+                "maximum_context_tokens",
+                "context_length",
+            ),
+            maxOutputTokens = intValue(
+                "max_output_tokens",
+                "maximum_output_tokens",
+                "max_tokens_limit",
+            ),
+        )
+    }
+
+    private data class ParsedProviderError(
+        val message: String? = null,
+        val code: String? = null,
+        val type: String? = null,
+        val parameter: String? = null,
+        val maxContextTokens: Int? = null,
+        val maxOutputTokens: Int? = null,
+    )
+}

@@ -1,0 +1,988 @@
+package com.android.everytalk.statecontroller.facade
+
+import android.util.Log
+import com.android.everytalk.data.DataClass.Message
+import com.android.everytalk.data.DataClass.ExecutionStep
+import com.android.everytalk.data.DataClass.ExecutionTraceEvent
+import com.android.everytalk.data.DataClass.Sender
+import com.android.everytalk.data.DataClass.WebSearchResult
+import com.android.everytalk.data.DataClass.hasReviewableExecutionProcess
+import com.android.everytalk.statecontroller.StreamingMessageStateManager
+import com.android.everytalk.statecontroller.ViewModelStateHolder
+import com.android.everytalk.statecontroller.freezeWhileStreamingPaused
+import com.android.everytalk.ui.components.WebMarkdownSourcesExtractor
+import com.android.everytalk.ui.components.streaming.PreparedMessage
+import com.android.everytalk.ui.components.streaming.PreparedMarkdownDocument
+import com.android.everytalk.ui.components.streaming.StreamBlockParser
+import com.android.everytalk.ui.components.streaming.IncrementalParseCache
+import com.android.everytalk.ui.components.streaming.StreamingRenderState
+import com.android.everytalk.ui.components.streaming.buildStreamingRenderStateIncremental
+import com.android.everytalk.ui.components.streaming.contentVersionForRendering
+import com.android.everytalk.ui.components.markdown.footnoteTargets
+import com.android.everytalk.ui.components.markdown.EveryTalkMarkdownFlavourDescriptor
+import com.android.everytalk.ui.components.markdown.markdownLinkLogoIndex
+import com.android.everytalk.ui.components.markdown.preparedMessageLinkLogoSource
+import com.android.everytalk.ui.screens.MainScreen.chat.core.ChatListItem
+import com.android.everytalk.ui.screens.MainScreen.chat.core.expandStaticAiMessageItem
+import com.android.everytalk.ui.screens.MainScreen.chat.core.OrderedAiOutputSegment
+import com.android.everytalk.ui.screens.MainScreen.chat.core.orderedAiOutputSegments
+import com.mikepenz.markdown.model.State
+import com.mikepenz.markdown.model.parseMarkdown
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.flow.flowOn
+import androidx.compose.runtime.snapshotFlow
+import java.util.concurrent.ConcurrentHashMap
+
+/**
+ * 将 AppViewModel 中与“AI气泡状态 + ChatListItem 构建”相关的大段逻辑外置。
+ * 仅依赖 ViewModelStateHolder 与提供的 CoroutineScope，不涉及 UI 层组件。
+ *
+ * 提供两个对外 StateFlow:
+ * - chatListItems: 文本对话的 ChatListItem 列表
+ * - imageGenerationChatListItems: 图像对话的 ChatListItem 列表
+ */
+open class MessageItemsController(
+    private val stateHolder: ViewModelStateHolder,
+    protected val streamingMessageStateManager: StreamingMessageStateManager,
+    scope: CoroutineScope
+) {
+
+    private data class CacheEntry(
+        val text: String,
+        val reasoning: String?,
+        val outputType: String,
+        val hasReasoning: Boolean,
+        val blocksHash: String,
+        val hasPendingMath: Boolean,
+        val imageUrls: List<String>?,
+        val webSearchResults: List<WebSearchResult>?,
+        val contentStarted: Boolean,
+        val executionStatus: String?,
+        val currentWebSearchStage: String?,
+        val executionSteps: List<ExecutionStep>,
+        val executionTrace: List<ExecutionTraceEvent>,
+        val items: List<ChatListItem>
+    )
+
+    private data class StaticAiRenderPreparation(
+        val displayText: String,
+        val pageSources: List<WebSearchResult>,
+        val parseResult: StreamBlockParser.ParseResult,
+        val preparedMessage: PreparedMessage,
+        val preparedMarkdownDocument: PreparedMarkdownDocument?,
+    )
+
+    /** 每个正文段独立保留增量 Markdown 状态，工具前后的正文互不污染。 */
+    private data class OrderedSegmentRenderCache(
+        val messageId: String,
+        val text: String,
+        val state: StreamingRenderState,
+        val incrementalCache: IncrementalParseCache,
+    )
+
+    private val chatListItemCache = ConcurrentHashMap<String, CacheEntry>()
+    private val imageGenerationChatListItemCache = ConcurrentHashMap<String, CacheEntry>()
+    private val orderedSegmentRenderCache = ConcurrentHashMap<String, OrderedSegmentRenderCache>()
+    private val liveTextMessageIds = ConcurrentHashMap.newKeySet<String>()
+
+    // 🔧 修复Loading不显示问题：记录每个消息开始流式传输的时间戳
+    // 用于确保Loading状态至少显示一段时间（防止后端响应过快时跳过Connecting状态）
+    private val streamingStartTimestamps = ConcurrentHashMap<String, Long>()
+    
+    // Loading状态最小显示时间（毫秒）- 确保用户能看到连接状态
+    private val MIN_CONNECTING_DISPLAY_TIME_MS = 300L
+
+    private fun buildEffectiveMessage(message: Message, isCurrentStreaming: Boolean): Message {
+        if (!isCurrentStreaming) return message
+        val renderState = streamingMessageStateManager.getCurrentRenderState(message.id)
+        val hasStreamingContent = !renderState.content.isNullOrBlank()
+        if (!hasStreamingContent || message.contentStarted) return message
+        return message.copy(contentStarted = true)
+    }
+
+    private fun prepareStaticAiRender(
+        message: Message,
+        parseResult: StreamBlockParser.ParseResult,
+    ): StaticAiRenderPreparation? {
+        if (message.text.isBlank()) return null
+        val extraction = WebMarkdownSourcesExtractor.extract(message.text)
+        val displayText = extraction.displayText
+        val displayParseResult = if (displayText == message.text) {
+            parseResult
+        } else {
+            StreamBlockParser.parse(displayText, "${message.id}:sources-stripped")
+        }
+        val preparedMessage = StreamBlockParser.prepareMessage(
+            content = displayText,
+            blocks = displayParseResult.blocks,
+            hasPendingFormula = displayParseResult.hasPendingMath,
+            contentVersion = contentVersionForRendering(displayText),
+        )
+        val preparedMarkdownDocument = (
+            parseMarkdown(
+                preparedMessage.markdown,
+                flavour = EveryTalkMarkdownFlavourDescriptor,
+            ) as? State.Success
+        )
+            ?.let { state ->
+                PreparedMarkdownDocument(
+                    state = state,
+                    nodes = state.node.children,
+                    targetNodeIndexByUri = buildMap {
+                        state.node.children.forEachIndexed { index, node ->
+                            footnoteTargets(state.content, node).forEach { uri ->
+                                put(uri, index)
+                            }
+                        }
+                    },
+                    linkLogoIndex = if (preparedMessage.details.isEmpty()) {
+                        markdownLinkLogoIndex(preparedMessage.markdown, state)
+                    } else {
+                        markdownLinkLogoIndex(preparedMessageLinkLogoSource(preparedMessage))
+                    },
+                )
+            }
+        return StaticAiRenderPreparation(
+            displayText = displayText,
+            pageSources = message.webSearchResults?.takeIf { it.isNotEmpty() } ?: extraction.sources,
+            parseResult = displayParseResult,
+            preparedMessage = preparedMessage,
+            preparedMarkdownDocument = preparedMarkdownDocument,
+        )
+    }
+
+    private fun resolveStreamingStageText(message: Message, _elapsedMs: Long, reasoningComplete: Boolean = false): String? {
+        val hasVisibleContent = message.contentStarted || message.text.isNotBlank()
+        val hasAgentLoop = message.executionSteps.isNotEmpty()
+        if (!hasVisibleContent || hasAgentLoop) {
+            message.executionStatus?.takeIf { it.isNotBlank() }?.let { status ->
+                formatStatusText(status)?.let { return it }
+            }
+            message.currentWebSearchStage?.takeIf { it.isNotBlank() }?.let {
+                normalizeStatusText(message).takeIf { it.isNotBlank() }?.let { return it }
+            }
+        }
+        if (!message.reasoning.isNullOrBlank() && !reasoningComplete) return "正在接收思考"
+        if (hasVisibleContent) return null
+        return buildRuntimeLoadingStatus(message, reasoningComplete)
+    }
+
+    private fun buildRuntimeLoadingStatus(message: Message, reasoningComplete: Boolean): String {
+        return when {
+            !message.reasoning.isNullOrBlank() && reasoningComplete -> "已收到思考，等待正文"
+            !message.reasoning.isNullOrBlank() -> "正在接收思考"
+            else -> "等待首个响应"
+        }
+    }
+
+    private fun isDisplayableBackendStatus(status: String): Boolean {
+        val normalized = status.trim().lowercase()
+        if (normalized.isBlank()) return false
+        val hiddenExactStatuses = setOf(
+            "connected",
+            "subscribed",
+            "done"
+        )
+        if (normalized in hiddenExactStatuses) return false
+        val hiddenPrefixes = listOf(
+            "chat_run:",
+            "agent_run:",
+            "history_loaded:",
+            "pairing_pending:",
+            "health:"
+        )
+        return hiddenPrefixes.none { normalized.startsWith(it) }
+    }
+
+    internal fun debugResolveStreamingStageText(message: Message, elapsedMs: Long, reasoningComplete: Boolean = false): String? {
+        return resolveStreamingStageText(message, elapsedMs, reasoningComplete)
+    }
+
+    internal fun debugComputeBubbleState(
+        message: Message,
+        isApiCalling: Boolean,
+        currentStreamingAiMessageId: String?,
+        isImageGeneration: Boolean
+    ): com.android.everytalk.ui.state.AiBubbleState {
+        return computeBubbleState(message, isApiCalling, currentStreamingAiMessageId, isImageGeneration)
+    }
+
+    private fun retainCurrentMessageState(
+        messages: List<Message>,
+        cache: MutableMap<String, CacheEntry>,
+    ) {
+        val currentIds = messages.mapTo(HashSet(messages.size)) { it.id }
+        cache.keys.retainAll(currentIds)
+        if (cache === chatListItemCache) {
+            orderedSegmentRenderCache.entries.removeIf { it.value.messageId !in currentIds }
+        }
+    }
+
+    private fun orderedSegmentRenderState(
+        messageId: String,
+        segmentIndex: Int,
+        text: String,
+        isStreaming: Boolean,
+    ): StreamingRenderState {
+        val key = "$messageId:$segmentIndex"
+        val previous = orderedSegmentRenderCache[key]
+        if (previous?.text == text && previous.state.isStreaming == isStreaming) {
+            return previous.state
+        }
+        val appendOnly = previous != null && text.startsWith(previous.text)
+        val (state, incrementalCache) = buildStreamingRenderStateIncremental(
+            messageId = "${messageId}_content_$segmentIndex",
+            content = text,
+            isStreaming = isStreaming,
+            isComplete = !isStreaming,
+            cache = previous?.incrementalCache?.takeIf { appendOnly } ?: IncrementalParseCache(),
+        )
+        orderedSegmentRenderCache[key] = OrderedSegmentRenderCache(
+            messageId = messageId,
+            text = text,
+            state = state,
+            incrementalCache = incrementalCache,
+        )
+        return state
+    }
+
+    val chatListItems: StateFlow<List<ChatListItem>> =
+        combine(
+            snapshotFlow { stateHolder.messages.toList() },
+            stateHolder._isTextApiCalling,
+            stateHolder._currentTextStreamingAiMessageId,
+        ) { messages, isApiCalling, currentStreamingAiMessageId ->
+            val renderableMessages = filterRenderableMessages(messages)
+            retainCurrentMessageState(renderableMessages, chatListItemCache)
+            liveTextMessageIds.retainAll(renderableMessages.mapTo(HashSet()) { it.id })
+            renderableMessages
+                .map { message ->
+                    when (message.sender) {
+                        Sender.AI -> {
+                            val cached = chatListItemCache[message.id]
+                            val hasReasoning = !message.reasoning.isNullOrBlank()
+                            val isCurrentlyStreaming = isApiCalling && message.id == currentStreamingAiMessageId
+                            if (
+                                isCurrentlyStreaming ||
+                                streamingMessageStateManager.isStreaming(message.id)
+                            ) {
+                                liveTextMessageIds.add(message.id)
+                            }
+                            val effectiveMessage = buildEffectiveMessage(message, isCurrentlyStreaming)
+
+                            // 定义仅流式状态下允许存在的组件类型
+                            val hasStreamingOnlyItems = cached?.items?.any {
+                                it is ChatListItem.LoadingIndicator ||
+                                    it is ChatListItem.AiMessageStreaming ||
+                                    it is ChatListItem.AiMessageCodeStreaming ||
+                                    it is ChatListItem.StatusIndicator
+                            } ?: false
+
+                            val reasoningComplete = stateHolder.textReasoningCompleteMap[message.id] ?: false
+
+                            val expectedStageText = if (isCurrentlyStreaming) {
+                                val elapsedMs = streamingStartTimestamps[message.id]?.let { System.currentTimeMillis() - it } ?: 0L
+                                resolveStreamingStageText(effectiveMessage, elapsedMs, reasoningComplete)
+                            } else null
+
+                            val activityStatusMatches = cached
+                                ?.items
+                                ?.filterIsInstance<ChatListItem.AiMessageReasoning>()
+                                ?.firstOrNull()
+                                ?.activityStatusText == expectedStageText
+                            val cachedFooter = cached?.items
+                                ?.filterIsInstance<ChatListItem.AiMessageFooter>()
+                                ?.firstOrNull()
+                            val hasOrderedOutput = message.executionTrace.any {
+                                it is ExecutionTraceEvent.Content
+                            }
+                            val expectedHasFooter = !message.isError && if (hasOrderedOutput) {
+                                !isCurrentlyStreaming
+                            } else if (isCurrentlyStreaming) {
+                                !message.webSearchResults.isNullOrEmpty()
+                            } else {
+                                effectiveMessage.text.isNotBlank() || !message.webSearchResults.isNullOrEmpty()
+                            }
+                            val footerMatches = (cachedFooter != null) == expectedHasFooter &&
+                                (!expectedHasFooter || cachedFooter?.message?.webSearchResults == message.webSearchResults)
+                            val allowStreamingBlocksHashReuse = cached != null &&
+                                !isCurrentlyStreaming &&
+                                !cached.hasPendingMath &&
+                                cached.text == message.text &&
+                                cached.items.any { it is ChatListItem.AiMessage || it is ChatListItem.AiMessageCode }
+
+                            val cacheValid = cached != null &&
+                                cached.text == message.text &&
+                                cached.reasoning == message.reasoning &&
+                                cached.outputType == message.outputType &&
+                                cached.hasReasoning == hasReasoning &&
+                                cached.imageUrls == message.imageUrls &&
+                                cached.webSearchResults == message.webSearchResults &&
+                                cached.contentStarted == effectiveMessage.contentStarted &&
+                                cached.executionStatus == message.executionStatus &&
+                                cached.currentWebSearchStage == message.currentWebSearchStage &&
+                                cached.executionSteps == message.executionSteps &&
+                                cached.executionTrace == message.executionTrace &&
+                                activityStatusMatches &&
+                                (cached.items.isNotEmpty() || message.text.isBlank()) &&
+                                footerMatches &&
+                                // 校验流式状态兼容性：
+                                // 当前正文 item 已复用完成态组件，结束时允许剔除 Loading/StatusIndicator 后继续命中缓存。
+                                (isCurrentlyStreaming || !hasStreamingOnlyItems || allowStreamingBlocksHashReuse)
+
+                            if (cacheValid) {
+                                cached.items
+                            } else {
+                                // 先用便宜字段判断缓存。只有消息真的变化时才解析 Markdown，
+                                // 避免当前消息流式刷新时反复解析全部历史消息。
+                                val parseResult = if (hasOrderedOutput) {
+                                    StreamBlockParser.ParseResult(
+                                        blocks = emptyList(),
+                                        hasPendingMath = false,
+                                        blocksHash = "ordered-output",
+                                    )
+                                } else {
+                                    resolveParseResult(
+                                        message = effectiveMessage,
+                                        preferStreamingState = isCurrentlyStreaming,
+                                    )
+                                }
+                                val newItems = createAiMessageItems(
+                                    effectiveMessage,
+                                    isApiCalling,
+                                    currentStreamingAiMessageId,
+                                    parseResult = parseResult,
+                                    allowLazyStaticRender = message.id !in liveTextMessageIds,
+                                )
+
+                                chatListItemCache[message.id] = CacheEntry(
+                                    text = message.text,
+                                    reasoning = message.reasoning,
+                                    outputType = message.outputType,
+                                    hasReasoning = hasReasoning,
+                                    blocksHash = parseResult.blocksHash,
+                                    hasPendingMath = parseResult.hasPendingMath,
+                                    imageUrls = message.imageUrls,
+                                    webSearchResults = message.webSearchResults,
+                                    contentStarted = effectiveMessage.contentStarted,
+                                    executionStatus = message.executionStatus,
+                                    currentWebSearchStage = message.currentWebSearchStage,
+                                    executionSteps = message.executionSteps,
+                                    executionTrace = message.executionTrace,
+                                    items = newItems
+                                )
+                                newItems
+                            }
+                        }
+                        else -> createOtherMessageItems(message)
+                    }
+                }
+                .flatten()
+        }
+        .distinctUntilChanged()
+        .flowOn(Dispatchers.Default)
+        .freezeWhileStreamingPaused(stateHolder._isStreamingPaused)
+        .stateIn(
+            scope = scope,
+            started = SharingStarted.WhileSubscribed(5000),
+            initialValue = emptyList()
+        )
+
+    val imageGenerationChatListItems: StateFlow<List<ChatListItem>> =
+        combine(
+            snapshotFlow { stateHolder.imageGenerationMessages.toList() },
+            stateHolder._isImageApiCalling,
+            stateHolder._currentImageStreamingAiMessageId,
+        ) { messages, isApiCalling, currentStreamingAiMessageId ->
+            val renderableMessages = filterRenderableMessages(messages)
+            retainCurrentMessageState(
+                renderableMessages,
+                imageGenerationChatListItemCache,
+            )
+            renderableMessages
+                .map { message ->
+                    when (message.sender) {
+                        Sender.AI -> {
+                            val cached = imageGenerationChatListItemCache[message.id]
+                            val hasReasoning = !message.reasoning.isNullOrBlank()
+                            val isCurrentlyStreaming = isApiCalling && message.id == currentStreamingAiMessageId
+                            val effectiveMessage = buildEffectiveMessage(message, isCurrentlyStreaming)
+                            val reasoningComplete = stateHolder.imageReasoningCompleteMap[message.id] ?: false
+                            val expectedStageText = if (isCurrentlyStreaming) {
+                                val elapsedMs = streamingStartTimestamps[message.id]?.let { System.currentTimeMillis() - it } ?: 0L
+                                resolveStreamingStageText(effectiveMessage, elapsedMs, reasoningComplete)
+                            } else null
+                            val activityStatusMatches = cached
+                                ?.items
+                                ?.filterIsInstance<ChatListItem.AiMessageReasoning>()
+                                ?.firstOrNull()
+                                ?.activityStatusText == expectedStageText
+
+                            val cacheValid = cached != null &&
+                                cached.text == message.text &&
+                                cached.reasoning == message.reasoning &&
+                                cached.outputType == message.outputType &&
+                                cached.hasReasoning == hasReasoning &&
+                                cached.imageUrls == message.imageUrls &&
+                                cached.webSearchResults == message.webSearchResults &&
+                                cached.contentStarted == effectiveMessage.contentStarted &&
+                                cached.executionStatus == message.executionStatus &&
+                                cached.currentWebSearchStage == message.currentWebSearchStage &&
+                                cached.executionSteps == message.executionSteps &&
+                                cached.executionTrace == message.executionTrace &&
+                                activityStatusMatches
+
+                            if (cacheValid) {
+                                cached.items
+                            } else {
+                                val parseResult = resolveParseResult(
+                                    message = effectiveMessage,
+                                    preferStreamingState = isCurrentlyStreaming,
+                                )
+                                val newItems = createAiMessageItems(
+                                    effectiveMessage,
+                                    isApiCalling,
+                                    currentStreamingAiMessageId,
+                                    parseResult = parseResult,
+                                    isImageGeneration = true
+                                )
+
+                                imageGenerationChatListItemCache[message.id] = CacheEntry(
+                                    text = message.text,
+                                    reasoning = message.reasoning,
+                                    outputType = message.outputType,
+                                    hasReasoning = hasReasoning,
+                                    blocksHash = parseResult.blocksHash,
+                                    hasPendingMath = parseResult.hasPendingMath,
+                                    imageUrls = message.imageUrls,
+                                    webSearchResults = message.webSearchResults,
+                                    contentStarted = effectiveMessage.contentStarted,
+                                    executionStatus = message.executionStatus,
+                                    currentWebSearchStage = message.currentWebSearchStage,
+                                    executionSteps = message.executionSteps,
+                                    executionTrace = message.executionTrace,
+                                    items = newItems
+                                )
+                                newItems
+                            }
+                        }
+                        else -> createOtherMessageItems(message)
+                    }
+                }
+                .flatten()
+        }
+        .distinctUntilChanged()
+        .flowOn(Dispatchers.Default)
+        .freezeWhileStreamingPaused(stateHolder._isStreamingPaused)
+        .stateIn(
+            scope = scope,
+            started = SharingStarted.WhileSubscribed(5000),
+            initialValue = emptyList()
+        )
+
+    private fun computeBubbleState(
+        message: Message,
+        isApiCalling: Boolean,
+        currentStreamingAiMessageId: String?,
+        isImageGeneration: Boolean
+    ): com.android.everytalk.ui.state.AiBubbleState {
+        if (message.isError) return com.android.everytalk.ui.state.AiBubbleState.Error(message.text)
+
+        val isCurrentStreaming = isApiCalling && message.id == currentStreamingAiMessageId
+        val effectiveMessage = buildEffectiveMessage(message, isCurrentStreaming)
+        val hasReasoning = !message.reasoning.isNullOrBlank()
+        val reasoningCompleteMap =
+            if (isImageGeneration) stateHolder.imageReasoningCompleteMap else stateHolder.textReasoningCompleteMap
+        val reasoningComplete = reasoningCompleteMap[message.id] ?: false
+        val streamingRenderState = if (isCurrentStreaming) {
+            streamingMessageStateManager.getCurrentRenderState(message.id)
+        } else {
+            null
+        }
+        val hasStreamingContent = !streamingRenderState?.content.isNullOrBlank()
+        val hasVisibleContent = effectiveMessage.contentStarted || effectiveMessage.text.isNotBlank() || hasStreamingContent
+        val hasVisibleReasoning = hasReasoning && !effectiveMessage.contentStarted
+
+        // 🔧 修复Loading不显示问题：记录流式开始时间
+        // 当开始流式传输时，记录时间戳；用于确保Loading状态至少显示MIN_CONNECTING_DISPLAY_TIME_MS
+        if (isCurrentStreaming && !hasVisibleContent && !streamingStartTimestamps.containsKey(message.id)) {
+            streamingStartTimestamps[message.id] = System.currentTimeMillis()
+            android.util.Log.d(
+                "MessageItemsController",
+                "🔧 Registered streaming start time for message: ${message.id.take(8)}"
+            )
+        }
+        
+        // 🔧 计算是否仍在最小显示时间内
+        val streamingStartTime = streamingStartTimestamps[message.id]
+        val isWithinMinDisplayTime = if (streamingStartTime != null && isCurrentStreaming) {
+            val elapsed = System.currentTimeMillis() - streamingStartTime
+            elapsed < MIN_CONNECTING_DISPLAY_TIME_MS
+        } else {
+            false
+        }
+
+        val verboseTag = "AppViewModelVerbose"
+        if (Log.isLoggable(verboseTag, Log.VERBOSE)) {
+            Log.v(
+                verboseTag,
+                "computeBubbleState: id=${message.id.take(8)}, " +
+                    "isStreaming=$isCurrentStreaming, hasReasoning=$hasReasoning, " +
+                    "reasoningComplete=$reasoningComplete, contentStarted=${effectiveMessage.contentStarted}, " +
+                    "message.reasoning=${message.reasoning?.take(20)}, isWithinMinDisplayTime=$isWithinMinDisplayTime"
+            )
+        }
+
+        val state = when {
+            isCurrentStreaming && hasVisibleReasoning -> {
+                com.android.everytalk.ui.state.AiBubbleState.Reasoning(
+                    message.reasoning,
+                    isComplete = reasoningComplete
+                )
+            }
+            // 仅在正文尚未开始前允许保留 Connecting，避免流式输出中途回退到默认连接态
+            isCurrentStreaming && !hasVisibleContent && isWithinMinDisplayTime -> {
+                com.android.everytalk.ui.state.AiBubbleState.Connecting()
+            }
+            isCurrentStreaming && hasVisibleContent -> {
+                // 清理时间戳，因为已经开始流式输出
+                streamingStartTimestamps.remove(message.id)
+                com.android.everytalk.ui.state.AiBubbleState.Streaming(
+                    content = streamingRenderState?.content.orEmpty().ifBlank { message.text },
+                    hasReasoning = hasReasoning,
+                    reasoningComplete = reasoningComplete
+                )
+            }
+            isCurrentStreaming && !hasReasoning && !hasVisibleContent -> {
+                com.android.everytalk.ui.state.AiBubbleState.Connecting()
+            }
+            hasVisibleContent -> {
+                // 清理时间戳，因为消息已完成
+                streamingStartTimestamps.remove(message.id)
+                com.android.everytalk.ui.state.AiBubbleState.Complete(
+                    content = message.text,
+                    reasoning = message.reasoning
+                )
+            }
+            else -> com.android.everytalk.ui.state.AiBubbleState.Idle
+        }
+
+        return state
+    }
+
+    private fun createAiMessageItems(
+        message: Message,
+        isApiCalling: Boolean,
+        currentStreamingAiMessageId: String?,
+        parseResult: StreamBlockParser.ParseResult? = null,
+        isImageGeneration: Boolean = false,
+        allowLazyStaticRender: Boolean = true,
+    ): List<ChatListItem> {
+        val state = computeBubbleState(message, isApiCalling, currentStreamingAiMessageId, isImageGeneration)
+        val reasoningCompleteMap =
+            if (isImageGeneration) stateHolder.imageReasoningCompleteMap else stateHolder.textReasoningCompleteMap
+        val reasoningComplete = reasoningCompleteMap[message.id] ?: false
+
+        if (
+            !isImageGeneration &&
+            message.executionTrace.any { it is ExecutionTraceEvent.Content }
+        ) {
+            return createOrderedAiOutputItems(
+                message = message,
+                state = state,
+                reasoningComplete = reasoningComplete,
+            )
+        }
+
+        val resolvedParseResult = parseResult ?: resolveParseResult(
+            message = message,
+            preferStreamingState = isApiCalling && message.id == currentStreamingAiMessageId,
+        )
+        val staticPreparation = if (state is com.android.everytalk.ui.state.AiBubbleState.Complete) {
+            prepareStaticAiRender(message, resolvedParseResult)
+        } else {
+            null
+        }
+        val completedParseResult = staticPreparation?.parseResult ?: resolvedParseResult
+
+        val hasReviewableProcess = message.hasReviewableExecutionProcess()
+
+        return when (state) {
+            is com.android.everytalk.ui.state.AiBubbleState.Connecting -> {
+                val elapsedMs = streamingStartTimestamps[message.id]?.let { System.currentTimeMillis() - it } ?: 0L
+                listOf(
+                    ChatListItem.AiMessageReasoning(
+                        message = message,
+                        activityStatusText = resolveStreamingStageText(message, elapsedMs, reasoningComplete),
+                    )
+                )
+            }
+            is com.android.everytalk.ui.state.AiBubbleState.Reasoning -> {
+                val elapsedMs = streamingStartTimestamps[message.id]?.let { System.currentTimeMillis() - it } ?: 0L
+                listOf(
+                    ChatListItem.AiMessageReasoning(
+                        message = message,
+                        activityStatusText = resolveStreamingStageText(message, elapsedMs, reasoningComplete),
+                    )
+                )
+            }
+            is com.android.everytalk.ui.state.AiBubbleState.Streaming -> {
+                val items = mutableListOf<ChatListItem>()
+                // 正文开始后继续保留所有可回看的执行记录，避免入口在流式转场时消失。
+                if (hasReviewableProcess) {
+                    val elapsedMs = streamingStartTimestamps[message.id]
+                        ?.let { System.currentTimeMillis() - it }
+                        ?: 0L
+                    items.add(
+                        ChatListItem.AiMessageReasoning(
+                            message = message,
+                            activityStatusText = resolveStreamingStageText(
+                                message,
+                                elapsedMs,
+                                reasoningComplete,
+                            ),
+                        )
+                    )
+                }
+
+                // 始终使用“完成态”组件类型，由统一 Markdown 入口实时接收流式内容。
+                // 这样在 Finish 事件到来时不会切换 item 类型，避免 LazyColumn 发生一次布局重排导致页面跳动
+                val streamingItem: ChatListItem = when (message.outputType) {
+                    "code" -> ChatListItem.AiMessageCode(message, message.id, message.text, state.hasReasoning)
+                    else -> ChatListItem.AiMessage(
+                        message = message,
+                        messageId = message.id,
+                        text = message.text,
+                        hasReasoning = state.hasReasoning,
+                        blocksHash = resolvedParseResult.blocksHash,
+                        hasPendingMath = resolvedParseResult.hasPendingMath,
+                        blocks = resolvedParseResult.blocks
+                    )
+                }
+                items.add(streamingItem)
+                
+                // 提前显示 Footer（如果有搜索结果），减少 Finish 时的结构突变
+                if (!message.webSearchResults.isNullOrEmpty()) {
+                    items.add(ChatListItem.AiMessageFooter(message))
+                }
+                
+                items
+            }
+            is com.android.everytalk.ui.state.AiBubbleState.Complete -> {
+                val items = mutableListOf<ChatListItem>()
+                if (hasReviewableProcess) {
+                    items.add(ChatListItem.AiMessageReasoning(message))
+                }
+
+                val hasImageContent = !message.imageUrls.isNullOrEmpty()
+                val hasTextContent = message.text.isNotBlank() || completedParseResult.blocks.isNotEmpty()
+
+                if (hasTextContent || (isImageGeneration && hasImageContent)) {
+                    val contentItem = when (message.outputType) {
+                            "code" -> ChatListItem.AiMessageCode(
+                                message = message,
+                                messageId = message.id,
+                                text = message.text,
+                                hasReasoning = !message.reasoning.isNullOrBlank(),
+                                blocks = completedParseResult.blocks,
+                                displayText = staticPreparation?.displayText ?: message.text,
+                                pageSources = staticPreparation?.pageSources.orEmpty(),
+                                preparedMessage = staticPreparation?.preparedMessage,
+                                preparedMarkdownDocument = staticPreparation?.preparedMarkdownDocument,
+                            )
+                            else -> ChatListItem.AiMessage(
+                                message = message,
+                                messageId = message.id,
+                                text = message.text,
+                                hasReasoning = !message.reasoning.isNullOrBlank(),
+                                blocksHash = completedParseResult.blocksHash,
+                                hasPendingMath = completedParseResult.hasPendingMath,
+                                blocks = completedParseResult.blocks,
+                                displayText = staticPreparation?.displayText ?: message.text,
+                                pageSources = staticPreparation?.pageSources.orEmpty(),
+                                preparedMessage = staticPreparation?.preparedMessage,
+                                preparedMarkdownDocument = staticPreparation?.preparedMarkdownDocument,
+                            )
+                        }
+                    items.addAll(
+                        if (isImageGeneration || !allowLazyStaticRender) {
+                            listOf(contentItem)
+                        } else {
+                            expandStaticAiMessageItem(contentItem)
+                        }
+                    )
+                }
+
+                if (!isImageGeneration) {
+                    items.add(ChatListItem.AiMessageFooter(message))
+                }
+
+                items
+            }
+            is com.android.everytalk.ui.state.AiBubbleState.Error -> {
+                buildList {
+                    if (hasReviewableProcess) {
+                        add(
+                            ChatListItem.AiMessageReasoning(
+                                message = message,
+                                activityStatusText = message.executionStatus,
+                            )
+                        )
+                    }
+                    add(ChatListItem.ErrorMessage(message.id, message.text))
+                }
+            }
+            else -> emptyList()
+        }
+    }
+
+    private fun filterRenderableMessages(messages: List<Message>): List<Message> {
+        return messages
+            .filterNot { it.sender == Sender.System && it.isPlaceholderName }
+            .dropWhile { it.sender == Sender.System && it.text.isNotBlank() }
+    }
+
+    /** 新消息按正文与执行过程的真实事件顺序生成列表项。 */
+    private fun createOrderedAiOutputItems(
+        message: Message,
+        state: com.android.everytalk.ui.state.AiBubbleState,
+        reasoningComplete: Boolean,
+    ): List<ChatListItem> {
+        val segments = orderedAiOutputSegments(message.executionTrace)
+        val replyIsStreaming = state is com.android.everytalk.ui.state.AiBubbleState.Connecting ||
+            state is com.android.everytalk.ui.state.AiBubbleState.Reasoning ||
+            state is com.android.everytalk.ui.state.AiBubbleState.Streaming
+        val lastProcessIndex = segments.indexOfLast { it is OrderedAiOutputSegment.Process }
+        val processCount = segments.count { it is OrderedAiOutputSegment.Process }
+        // 正文已经继续输出时，前一个过程段已经结束，不能继续沿用整条回复的计时器。
+        val activeProcessIndex = lastProcessIndex.takeIf {
+            replyIsStreaming && lastProcessIndex == segments.lastIndex
+        } ?: -1
+        val activityStatus = if (replyIsStreaming) {
+            val elapsedMs = streamingStartTimestamps[message.id]
+                ?.let { System.currentTimeMillis() - it }
+                ?: 0L
+            resolveStreamingStageText(message, elapsedMs, reasoningComplete)
+        } else {
+            message.executionStatus
+        }
+
+        return buildList {
+            val firstContent = segments.firstOrNull() as? OrderedAiOutputSegment.Content
+            val firstContentStartedAt = firstContent?.startedAtMillis
+            if (firstContentStartedAt != null && firstContentStartedAt > message.timestamp) {
+                // 第一段正文到达后，保留请求开始到首字出现的真实耗时。
+                // 这段没有思考或工具事件，只显示耗时标题，不伪造执行详情。
+                add(
+                    ChatListItem.AiMessageProcessSegment(
+                        messageId = message.id,
+                        segmentIndex = -1,
+                        events = emptyList(),
+                        detailStartIndex = 0,
+                        activityStatusText = null,
+                        replyIsStreaming = false,
+                        processIsActive = false,
+                        webSearchResults = emptyList(),
+                        messageIsError = false,
+                        executionStartedAtMillis = message.timestamp,
+                        executionFinishedAtMillis = firstContentStartedAt,
+                    )
+                )
+            }
+            segments.forEachIndexed { segmentIndex, segment ->
+                when (segment) {
+                    is OrderedAiOutputSegment.Content -> if (segment.text.isNotBlank()) {
+                        val isStreamingSegment = replyIsStreaming && segmentIndex == segments.lastIndex
+                        val segmentMessage = Message(
+                            id = "${message.id}_content_$segmentIndex",
+                            text = segment.text,
+                            sender = message.sender,
+                            contentStarted = true,
+                            timestamp = message.timestamp,
+                            outputType = message.outputType,
+                        )
+                        add(
+                            ChatListItem.AiMessageContentSegment(
+                                sourceMessageId = message.id,
+                                message = segmentMessage,
+                                segmentIndex = segmentIndex,
+                                text = segment.text,
+                                isStreaming = isStreamingSegment,
+                                renderState = orderedSegmentRenderState(
+                                    messageId = message.id,
+                                    segmentIndex = segmentIndex,
+                                    text = segment.text,
+                                    isStreaming = isStreamingSegment,
+                                ),
+                            )
+                        )
+                    }
+                    is OrderedAiOutputSegment.Process -> {
+                        // 旧消息没有分段时间。只有整条回复仅含一个过程段时，才沿用旧的总耗时；
+                        // 多个旧过程段不再全部显示同一个伪造时间。
+                        val useLegacyWholeMessageTiming =
+                            segment.startedAtMillis == null && processCount == 1
+                        val segmentStartedAt = segment.startedAtMillis
+                            ?: message.timestamp.takeIf { useLegacyWholeMessageTiming }
+                        val segmentFinishedAt = segment.finishedAtMillis
+                            ?: message.executionFinishedAt.takeIf {
+                                segmentIndex == lastProcessIndex &&
+                                    (segment.startedAtMillis != null || useLegacyWholeMessageTiming)
+                            }
+                        add(ChatListItem.AiMessageProcessSegment(
+                            messageId = message.id,
+                            segmentIndex = segmentIndex,
+                            events = segment.events,
+                            detailStartIndex = segment.detailStartIndex,
+                            activityStatusText = activityStatus.takeIf {
+                                segmentIndex == activeProcessIndex ||
+                                    (message.isError && segmentIndex == lastProcessIndex)
+                            },
+                            replyIsStreaming = segmentIndex == activeProcessIndex,
+                            processIsActive = segmentIndex == activeProcessIndex,
+                            webSearchResults = message.webSearchResults.orEmpty(),
+                            messageIsError = message.isError && segmentIndex == lastProcessIndex,
+                            executionStartedAtMillis = segmentStartedAt,
+                            executionFinishedAtMillis = segmentFinishedAt,
+                        ))
+                    }
+                }
+            }
+
+            if (!replyIsStreaming && !message.isError) {
+                add(ChatListItem.AiMessageFooter(message))
+            } else if (message.isError && none { it is ChatListItem.AiMessageContentSegment }) {
+                add(ChatListItem.ErrorMessage(message.id, message.text))
+            }
+        }
+    }
+
+    protected fun normalizeStatusText(message: Message): String {
+        val status = message.currentWebSearchStage.orEmpty()
+
+        val toolResultPrefix = "[工具结果] "
+        return if (message.text.startsWith(toolResultPrefix)) {
+            compactStatusText("工具结果 · " + message.text.removePrefix(toolResultPrefix))
+        } else {
+            formatStatusText(status).orEmpty()
+        }
+    }
+
+    private fun formatStatusText(rawStatus: String): String? {
+        val status = rawStatus.trim()
+        if (!isDisplayableBackendStatus(status)) return null
+
+        val normalized = status.lowercase()
+        val display = when (normalized) {
+            "searching_web" -> "搜索网页"
+            "webfetch_reading" -> "读取网页"
+            else -> status
+        }
+        return compactStatusText(display)
+    }
+
+    private fun compactStatusText(text: String, maxChars: Int = 28): String {
+        val normalized = text.replace(Regex("\\s+"), " ").trim()
+        if (normalized.length <= maxChars) return normalized
+        return normalized.take((maxChars - 3).coerceAtLeast(1)).trimEnd() + "..."
+    }
+
+    private fun createOtherMessageItems(message: Message): List<ChatListItem> {
+        return when {
+            message.sender == Sender.User ->
+                listOf(
+                    ChatListItem.UserMessage(
+                        messageId = message.id,
+                        text = message.text,
+                        attachments = message.attachments
+                    )
+                )
+            message.sender == Sender.System ->
+                listOf(
+                    ChatListItem.SystemMessage(
+                        messageId = message.id,
+                        text = message.text
+                    )
+                )
+            message.isError ->
+                listOf(ChatListItem.ErrorMessage(messageId = message.id, text = message.text))
+            else -> emptyList()
+        }
+    }
+
+    /**
+     * 清除指定消息的缓存，强制重新计算ChatListItem
+     * 用于消息编辑后确保UI更新
+     */
+    fun clearCacheForMessage(messageId: String, isImageGeneration: Boolean = false) {
+        if (isImageGeneration) {
+            imageGenerationChatListItemCache.remove(messageId)
+            android.util.Log.d("MessageItemsController", "Cleared IMAGE cache for message: ${messageId.take(8)}")
+        } else {
+            chatListItemCache.remove(messageId)
+            orderedSegmentRenderCache.entries.removeIf { it.value.messageId == messageId }
+            android.util.Log.d("MessageItemsController", "Cleared TEXT cache for message: ${messageId.take(8)}")
+        }
+        streamingStartTimestamps.remove(messageId)
+        liveTextMessageIds.remove(messageId)
+    }
+
+    /**
+     * 清除所有缓存
+     */
+    fun clearAllCaches() {
+        chatListItemCache.clear()
+        imageGenerationChatListItemCache.clear()
+        orderedSegmentRenderCache.clear()
+        streamingStartTimestamps.clear()
+        liveTextMessageIds.clear()
+        android.util.Log.d("MessageItemsController", "Cleared all caches and streaming timestamps")
+    }
+    
+    /**
+     * 清理指定消息的流式时间戳
+     * 在消息完成或取消时调用
+     */
+    fun clearStreamingTimestamp(messageId: String) {
+        streamingStartTimestamps.remove(messageId)
+        android.util.Log.d("MessageItemsController", "Cleared streaming timestamp for message: ${messageId.take(8)}")
+    }
+
+    private fun resolveParseResult(
+        message: Message,
+        preferStreamingState: Boolean,
+    ): StreamBlockParser.ParseResult {
+        val shouldUseStreamingState = preferStreamingState || streamingMessageStateManager.isStreaming(message.id)
+        if (!shouldUseStreamingState) {
+            // 当 message.text 为空但 render state 仍有内容时，使用 render state 兜底，
+            // 避免 activeStreamingMessages.remove 和 message.text 同步之间的竞态窗口
+            // 导致一帧空白内容和高度坍塌。
+            if (message.text.isBlank()) {
+                val renderState = streamingMessageStateManager.getCurrentRenderState(message.id)
+                if (renderState.content.isNotBlank()) {
+                    return StreamBlockParser.ParseResult(
+                        blocks = renderState.blocks,
+                        hasPendingMath = renderState.hasPendingMath,
+                        blocksHash = renderState.blocksHash,
+                    )
+                }
+            }
+            return StreamBlockParser.parse(message.text, message.id)
+        }
+
+        val renderState = streamingMessageStateManager.getCurrentRenderState(message.id)
+        val content = renderState.content.ifBlank { message.text }
+
+        return StreamBlockParser.ParseResult(
+            blocks = renderState.blocks,
+            hasPendingMath = renderState.hasPendingMath,
+            blocksHash = renderState.blocksHash,
+        )
+    }
+}

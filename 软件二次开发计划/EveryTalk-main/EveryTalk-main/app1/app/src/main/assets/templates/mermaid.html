@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <script src="../mermaid/mermaid.min.js"></script>
+    <style>
+        html, body { height: 100%; }
+        body {
+            margin: 0;
+            padding: calc(env(safe-area-inset-top, 0px) + 64px) 16px 32px 16px;
+            background-color: #ffffff;
+            color: #000000;
+            box-sizing: border-box;
+            overflow: auto;
+            display: flex;
+            align-items: flex-start;
+            justify-content: center;
+        }
+        @media (prefers-color-scheme: dark) {
+            body { background-color: #101010; color: #f7f7f7; }
+        }
+        #container {
+            width: 100%;
+            max-width: 1200px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+    </style>
+</head>
+<body>
+    <div id="container" class="mermaid">
+        <!-- CONTENT_PLACEHOLDER -->
+    </div>
+    <script>
+        Promise.resolve()
+            .then(function() {
+                mermaid.initialize({
+                    startOnLoad: false,
+                    theme: window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'default'
+                });
+                return mermaid.run({ nodes: [document.getElementById('container')] });
+            })
+            .then(function() {
+                window.__everytalkPreviewReady();
+            })
+            .catch(function(error) {
+                window.__everytalkPreviewError(error);
+            });
+    </script>
+</body>
+</html>

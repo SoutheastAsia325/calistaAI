@@ -1,0 +1,150 @@
+package com.android.everytalk.ui.topanchor
+
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
+import org.junit.Test
+
+class TopAnchorTurnPolicyTest {
+    @Test
+    fun `uses sent user before assistant target`() {
+        val turn = resolveActiveTopAnchorTurn(
+            items = listOf(
+                TopAnchorItem("u0", TopAnchorItemRole.User),
+                TopAnchorItem("a0", TopAnchorItemRole.AssistantTarget),
+                TopAnchorItem("u1", TopAnchorItemRole.User),
+                TopAnchorItem("a1", TopAnchorItemRole.AssistantTarget)
+            ),
+            sentUserMessageId = "u1",
+            sessionKey = "s1",
+            generation = 1L,
+        )
+
+        assertEquals("u1", turn?.anchorMessageId)
+        assertEquals("a1", turn?.targetItemId)
+    }
+
+    @Test
+    fun `activates when sent id is first user`() {
+        val turn = resolveActiveTopAnchorTurn(
+            items = listOf(
+                TopAnchorItem("u1", TopAnchorItemRole.User),
+                TopAnchorItem("a1", TopAnchorItemRole.AssistantTarget)
+            ),
+            sentUserMessageId = "u1",
+            sessionKey = "s1",
+            generation = 1L,
+        )
+
+        assertEquals("u1", turn?.anchorMessageId)
+        assertEquals("a1", turn?.targetItemId)
+    }
+
+    @Test
+    fun `activates as soon as sent user item enters list`() {
+        val turn = resolveActiveTopAnchorTurn(
+            items = listOf(
+                TopAnchorItem("u0", TopAnchorItemRole.User),
+                TopAnchorItem("a0", TopAnchorItemRole.AssistantTarget),
+                TopAnchorItem("u1", TopAnchorItemRole.User)
+            ),
+            sentUserMessageId = "u1",
+            sessionKey = "s1",
+            generation = 1L,
+        )
+
+        assertEquals("u1", turn?.anchorMessageId)
+        assertNull(turn?.targetItemId)
+    }
+
+    @Test
+    fun `keeps target null when only non target item follows user`() {
+        val turn = resolveActiveTopAnchorTurn(
+            items = listOf(
+                TopAnchorItem("u0", TopAnchorItemRole.User),
+                TopAnchorItem("a0", TopAnchorItemRole.AssistantTarget),
+                TopAnchorItem("u1", TopAnchorItemRole.User),
+                TopAnchorItem("sys", TopAnchorItemRole.NonTarget)
+            ),
+            sentUserMessageId = "u1",
+            sessionKey = "s1",
+            generation = 1L,
+        )
+
+        assertEquals("u1", turn?.anchorMessageId)
+        assertNull(turn?.targetItemId)
+    }
+
+    @Test
+    fun `response target lookup stops at the next user turn`() {
+        val targetId = resolveTopAnchorResponseTargetId(
+            items = listOf(
+                TopAnchorItem("u1", TopAnchorItemRole.User),
+                TopAnchorItem("system", TopAnchorItemRole.NonTarget),
+                TopAnchorItem("u2", TopAnchorItemRole.User),
+                TopAnchorItem("a2", TopAnchorItemRole.AssistantTarget),
+            ),
+            anchorMessageId = "u1",
+        )
+
+        assertNull(targetId)
+    }
+
+    @Test
+    fun `does not fall back to another user when sent id is absent`() {
+        val turn = resolveActiveTopAnchorTurn(
+            items = listOf(
+                TopAnchorItem("u1", TopAnchorItemRole.User),
+                TopAnchorItem("a1", TopAnchorItemRole.AssistantTarget)
+            ),
+            sentUserMessageId = "missing-user",
+            sessionKey = "s1",
+            generation = 1L,
+        )
+
+        assertNull(turn)
+    }
+
+    @Test
+    fun `waits until regenerated historical user becomes the last user turn`() {
+        val staleTurn = resolveActiveTopAnchorTurn(
+            items = listOf(
+                TopAnchorItem("u1", TopAnchorItemRole.User),
+                TopAnchorItem("u2", TopAnchorItemRole.User),
+                TopAnchorItem("a2", TopAnchorItemRole.AssistantTarget),
+            ),
+            sentUserMessageId = "u1",
+            sessionKey = "s1",
+            generation = 1L,
+        )
+        val committedTurn = resolveActiveTopAnchorTurn(
+            items = listOf(
+                TopAnchorItem("u2", TopAnchorItemRole.User),
+                TopAnchorItem("a2", TopAnchorItemRole.AssistantTarget),
+                TopAnchorItem("u1", TopAnchorItemRole.User),
+            ),
+            sentUserMessageId = "u1",
+            sessionKey = "s1",
+            generation = 2L,
+        )
+
+        assertNull(staleTurn)
+        assertEquals("u1", committedTurn?.anchorMessageId)
+        assertNull(committedTurn?.targetItemId)
+    }
+
+    @Test
+    fun `pending sent id is sufficient even before api running state`() {
+        val turn = resolveActiveTopAnchorTurn(
+            items = listOf(
+                TopAnchorItem("u1", TopAnchorItemRole.User),
+                TopAnchorItem("a1", TopAnchorItemRole.AssistantTarget),
+            ),
+            sentUserMessageId = "u1",
+            sessionKey = "s1",
+            generation = 1L,
+        )
+
+        assertEquals("u1", turn?.anchorMessageId)
+        assertEquals("a1", turn?.targetItemId)
+    }
+}

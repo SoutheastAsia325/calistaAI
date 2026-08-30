@@ -1,0 +1,92 @@
+package com.android.everytalk.data.network
+
+import com.android.everytalk.R
+import com.android.everytalk.data.DataClass.ApiConfig
+import com.android.everytalk.data.DataClass.ModelParameterProtocol
+import com.android.everytalk.ui.screens.MainScreen.chat.text.ui.webSearchToggleLabelRes
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
+import org.junit.Test
+
+class WebSearchSupportTest {
+
+    @Test
+    fun `gemini model supports native web search`() {
+        val config = createConfig(channel = "Gemini", model = "gemini-2.5-flash")
+
+        assertTrue(WebSearchSupport.supportsNativeWebSearch(config))
+        assertFalse(WebSearchSupport.shouldEnableQwenNativeSearch(config, isWebSearchEnabled = true))
+    }
+
+    @Test
+    fun `prefixed gemini model is recognized in openai compatible channel`() {
+        val config = createConfig(channel = "OpenAI兼容", model = "custom-12newapi/gemini-3-flash-preview")
+
+        assertTrue(WebSearchSupport.isGeminiModel(config))
+        assertFalse(WebSearchSupport.supportsNativeWebSearch(config))
+    }
+
+    @Test
+    fun `model protocol override controls request capability without changing group channel`() {
+        val base = createConfig(channel = "OpenAI兼容", model = "gemini-3-flash-preview")
+        val config = base.copy(
+            modelParameters = base.modelParameters.copy(
+                apiProtocolOverride = ModelParameterProtocol.GEMINI,
+            ),
+        )
+
+        assertEquals("OpenAI兼容", config.channel)
+        assertTrue(WebSearchSupport.supportsNativeWebSearch(config))
+    }
+
+    @Test
+    fun `qwen model supports native web search`() {
+        val config = createConfig(channel = "OpenAI兼容", model = "qwen-max")
+
+        assertTrue(WebSearchSupport.supportsNativeWebSearch(config))
+        assertTrue(WebSearchSupport.shouldEnableQwenNativeSearch(config, isWebSearchEnabled = true))
+    }
+
+    @Test
+    fun `non gemini and non qwen models do not support web search`() {
+        val config = createConfig(channel = "OpenAI兼容", model = "gpt-4o")
+
+        assertFalse(WebSearchSupport.supportsNativeWebSearch(config))
+        assertFalse(WebSearchSupport.shouldEnableQwenNativeSearch(config, isWebSearchEnabled = true))
+    }
+
+    @Test
+    fun `unsupported model shows unavailable search label`() {
+        assertEquals(
+            R.string.chat_input_search_unavailable,
+            webSearchToggleLabelRes(isSupported = false, isEnabled = false),
+        )
+    }
+
+    @Test
+    fun `supported and disabled toggle shows online search label`() {
+        assertEquals(
+            R.string.chat_input_web_search,
+            webSearchToggleLabelRes(isSupported = true, isEnabled = false),
+        )
+    }
+
+    @Test
+    fun `disabled toggle does not enable qwen native search`() {
+        val config = createConfig(channel = "OpenAI兼容", model = "qwen-plus")
+
+        assertFalse(WebSearchSupport.shouldEnableQwenNativeSearch(config, isWebSearchEnabled = false))
+    }
+
+    private fun createConfig(channel: String, model: String): ApiConfig {
+        return ApiConfig(
+            address = "https://api.example.com",
+            key = "test-key",
+            model = model,
+            provider = "test",
+            name = "test-config",
+            channel = channel
+        )
+    }
+}

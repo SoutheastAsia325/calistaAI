@@ -1,0 +1,140 @@
+package com.android.everytalk.ui.components
+import com.android.everytalk.statecontroller.*
+
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.FastOutLinearInEasing
+import androidx.compose.animation.core.LinearOutSlowInEasing
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.ArrowDownward
+import androidx.compose.material3.Icon
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.luminance
+import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.res.stringResource
+import com.android.everytalk.R
+import com.android.everytalk.ui.screens.MainScreen.chat.text.state.ChatScrollStateManager
+
+private const val ScrollToBottomFadeInMillis = 360
+
+internal fun shouldShowScrollToBottomButtonForFrame(
+    baseVisible: Boolean,
+    suppressed: Boolean = false,
+): Boolean {
+    return baseVisible && !suppressed
+}
+
+internal fun scrollToBottomButtonFadeInMillis(): Int {
+    return ScrollToBottomFadeInMillis
+}
+
+internal fun scrollToBottomButtonDarkBorderColor(): Color {
+    return Color.White.copy(alpha = 0.42f)
+}
+
+internal fun scrollToBottomButtonBorder(isDarkTheme: Boolean): BorderStroke? {
+    return if (isDarkTheme) {
+        BorderStroke(
+            width = 1.dp,
+            color = scrollToBottomButtonDarkBorderColor()
+        )
+    } else {
+        null
+    }
+}
+
+@Composable
+fun ScrollToBottomButton(
+    scrollStateManager: ChatScrollStateManager,
+    modifier: Modifier = Modifier,
+    bottomPadding: Dp = 150.dp,
+    endPadding: Dp = 0.dp,
+    suppressed: Boolean = false,
+) {
+    // 权限卡退场时必须直接移除按钮。AnimatedVisibility 的退场图层会保留旧坐标，
+    // 输入区缩短后就会在页面中部闪现一次。
+    if (suppressed) return
+
+    val baseVisible by scrollStateManager.showScrollToBottomButton
+    val isScrollInProgress by scrollStateManager.isScrollInProgress
+    val showButton = shouldShowScrollToBottomButtonForFrame(
+        baseVisible = baseVisible,
+    )
+
+    AnimatedVisibility(
+        visible = showButton,
+        modifier = modifier.fillMaxSize(),
+        enter = fadeIn(
+            animationSpec = tween(
+                durationMillis = scrollToBottomButtonFadeInMillis(),
+                easing = LinearOutSlowInEasing
+            )
+        ),
+        exit = fadeOut(
+            animationSpec = tween(
+                durationMillis = if (isScrollInProgress) 0 else 220,
+                easing = FastOutLinearInEasing
+            )
+        )
+    ) {
+        val isDarkTheme = MaterialTheme.colorScheme.surface.luminance() < 0.5f
+        val containerColor = if (isDarkTheme) {
+            MaterialTheme.colorScheme.background
+        } else {
+            Color(0xFFF2F2F2)
+        }
+        val contentColor = if (isDarkTheme) Color.White else Color.Black
+        val borderStroke = scrollToBottomButtonBorder(isDarkTheme)
+
+        Box(modifier = Modifier.fillMaxSize()) {
+            Box(
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .padding(bottom = bottomPadding)
+                    .size(40.dp)
+                    .shadow(
+                        elevation = if (isDarkTheme) 0.dp else 8.dp,
+                        shape = CircleShape,
+                        clip = false
+                    )
+                    .clip(CircleShape)
+                    .background(containerColor)
+                    .then(
+                        if (borderStroke != null) {
+                            Modifier.border(borderStroke, CircleShape)
+                        } else {
+                            Modifier
+                        }
+                    )
+                    .clickable { scrollStateManager.jumpToBottom(true) },
+                contentAlignment = Alignment.Center
+            ) {
+                Icon(
+                    imageVector = Icons.Filled.ArrowDownward,
+                    contentDescription = stringResource(R.string.chat_scroll_to_bottom),
+                    tint = contentColor,
+                    modifier = Modifier.size(20.dp)
+                )
+            }
+        }
+    }
+}

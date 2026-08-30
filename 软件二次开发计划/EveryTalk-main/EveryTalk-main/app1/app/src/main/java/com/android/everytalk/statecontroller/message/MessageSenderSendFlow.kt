@@ -1,0 +1,1050 @@
+package com.android.everytalk.statecontroller
+
+import android.app.Application
+import android.os.Build
+import com.android.everytalk.R
+import android.content.ContentResolver
+import android.content.Context
+import android.net.Uri
+import android.provider.OpenableColumns
+import android.util.Log
+import androidx.compose.runtime.snapshots.Snapshot
+import androidx.core.content.FileProvider
+import com.android.everytalk.models.SelectedMediaItem
+import com.android.everytalk.util.image.ImagePersistenceResult
+import com.android.everytalk.util.image.USER_IMAGE_PERSISTENCE_POLICY
+import com.android.everytalk.data.DataClass.AbstractApiMessage
+import com.android.everytalk.data.DataClass.ApiContentPart
+import com.android.everytalk.data.DataClass.ApiConfig
+import com.android.everytalk.data.DataClass.ChatRequest
+import com.android.everytalk.data.DataClass.ContextUsageSnapshot
+import com.android.everytalk.data.DataClass.ContextCompressionState
+import com.android.everytalk.data.DataClass.MAX_AUTO_CONTEXT_COMPRESSION_THRESHOLD_PERCENT
+import com.android.everytalk.data.DataClass.RequestContextManagement
+import com.android.everytalk.data.DataClass.ModelParameterProtocol
+import com.android.everytalk.data.DataClass.MessageToolIds
+import com.android.everytalk.data.DataClass.MessageContentPart
+import com.android.everytalk.data.DataClass.toApiText
+import com.android.everytalk.data.computer.ComputerException
+import com.android.everytalk.data.DataClass.PartsApiMessage
+import com.android.everytalk.data.DataClass.SimpleTextApiMessage
+import com.android.everytalk.data.DataClass.Message as UiMessage
+import com.android.everytalk.data.DataClass.Sender as UiSender
+import com.android.everytalk.data.DataClass.ImageGenRequest
+import com.android.everytalk.data.DataClass.GenerationConfig
+import com.android.everytalk.data.DataClass.modelParameterProtocol
+import com.android.everytalk.data.DataClass.effectiveModelChannel
+import com.android.everytalk.data.DataClass.openAICompatibleRequestParameters
+import com.android.everytalk.data.DataClass.resolvedModelTokenLimits
+import com.android.everytalk.data.DataClass.toThinkingConfig
+import com.android.everytalk.data.network.WebSearchSupport
+import com.android.everytalk.data.network.ExternalWebSearchProvider
+import com.android.everytalk.data.network.PromptCachePolicy
+import com.android.everytalk.data.network.AnthropicDirectClient
+import com.android.everytalk.data.network.MAX_ATTACHMENT_PAGE_CHARS
+import com.android.everytalk.data.network.buildDirectMultimodalRequest
+import com.android.everytalk.data.network.isOfficialAnthropicMessagesAddress
+import com.android.everytalk.data.network.isOfficialOpenAIResponsesAddress
+import com.android.everytalk.statecontroller.mcp.dispatch.McpToolCandidate
+import com.android.everytalk.statecontroller.mcp.dispatch.QueryIntent
+import com.android.everytalk.statecontroller.mcp.dispatch.classifyMcpIntent
+import com.android.everytalk.statecontroller.mcp.dispatch.selectMcpCandidates
+import com.android.everytalk.statecontroller.mcp.dispatch.toToolDefinition
+import com.android.everytalk.ui.screens.viewmodel.HistoryManager
+import com.android.everytalk.util.AiContentSafetyDecision
+import com.android.everytalk.util.AiContentSafetyPolicy
+import com.android.everytalk.util.ConversationNameHelper
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.async
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.io.File
+import java.util.UUID
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.booleanOrNull
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.doubleOrNull
+import kotlinx.serialization.json.longOrNull
+import kotlinx.serialization.json.jsonPrimitive
+import com.android.everytalk.data.skill.skillToolDefinitions
+
+private fun hasSuccessfulAnthropicCompaction(inputJson: String?): Boolean = runCatching {
+    val messages = Json.parseToJsonElement(inputJson.orEmpty()) as? JsonArray ?: return@runCatching false
+    messages.any { messageElement ->
+        val content = (messageElement as? JsonObject)?.get("content") as? JsonArray ?: return@any false
+        content.any { blockElement ->
+            val block = blockElement as? JsonObject ?: return@any false
+            block["type"]?.jsonPrimitive?.contentOrNull == "compaction" &&
+                block["content"]?.jsonPrimitive?.contentOrNull?.takeUnless { it == "null" }?.isNotBlank() == true
+        }
+    }
+}.getOrDefault(false)
+
+internal fun enabledMessageToolIdsForRequest(
+    isImageGeneration: Boolean,
+    webSearchEnabled: Boolean,
+    mcpEnabled: Boolean,
+    agentEnabled: Boolean = false,
+): List<String> {
+    if (isImageGeneration) return emptyList()
+    return buildList {
+        if (webSearchEnabled) add(MessageToolIds.WEB_SEARCH)
+        if (mcpEnabled) add(MessageToolIds.MCP)
+        if (agentEnabled) add(MessageToolIds.AGENT)
+    }
+}
+
+/** AI 加载占位不参与首条用户消息判断，避免开启 Agent 后新会话漏掉首次入库。 */
+internal fun isFirstUserMessageForNewChat(
+    messages: List<UiMessage>,
+    loadedHistoryIndex: Int?,
+): Boolean = loadedHistoryIndex == null && messages.count { it.sender == UiSender.User } == 1
+
+internal fun MessageSender.sendMessageInternal(
+        messageText: String,
+        isFromRegeneration: Boolean = false,
+        attachments: List<SelectedMediaItem> = emptyList(),
+        audioBase64: String? = null,
+        mimeType: String? = null,
+        systemPrompt: String? = null,
+        isImageGeneration: Boolean = false,
+        manualMessageId: String? = null,
+        contentParts: List<MessageContentPart> = emptyList(),
+    ) {
+        val textToActuallySend = messageText.trim()
+        val allAttachments = attachments.toMutableList()
+        if (audioBase64 != null) {
+            allAttachments.add(SelectedMediaItem.Audio(id = "audio_${UUID.randomUUID()}", mimeType = mimeType ?: "audio/3gpp", data = audioBase64))
+        }
+
+        if (textToActuallySend.isBlank() && allAttachments.isEmpty()) {
+            viewModelScope.launch { showSnackbar("请输入消息内容或选择项目") }
+            return
+        }
+
+        when (
+            val safetyDecision = AiContentSafetyPolicy.evaluateUserInput(
+                text = textToActuallySend,
+                isImageGeneration = isImageGeneration,
+            )
+        ) {
+            AiContentSafetyDecision.Allowed -> Unit
+            is AiContentSafetyDecision.Blocked -> {
+                Log.w(
+                    "MessageSender",
+                    "AI 内容安全过滤已拦截请求：category=${safetyDecision.category}",
+                )
+                viewModelScope.launch { showSnackbar(safetyDecision.userMessage) }
+                return
+            }
+        }
+        
+        // 🔥 关键调试：检查配置状态
+        Log.d("MessageSender", "=== SEND MESSAGE DEBUG ===")
+        Log.d("MessageSender", "inputChars=${messageText.length}, trimmedChars=${textToActuallySend.length}, attachments=${allAttachments.size}")
+        Log.d("MessageSender", "textConversationId=${stateHolder._currentConversationId.value}")
+        Log.d("MessageSender", "imageConversationId=${stateHolder._currentImageGenerationConversationId.value}")
+        Log.d("MessageSender", "isImageGeneration: $isImageGeneration")
+        Log.d("MessageSender", "selectedImageGenApiConfig: ${safeApiConfigSummary(stateHolder._selectedImageGenApiConfig.value)}")
+        Log.d("MessageSender", "selectedApiConfig: ${safeApiConfigSummary(stateHolder._selectedApiConfig.value)}")
+        Log.d("MessageSender", "imageGenerationMessages.size: ${stateHolder.imageGenerationMessages.size}")
+        Log.d("MessageSender", "messages.size: ${stateHolder.messages.size}")
+        
+        val currentConfig = (if (isImageGeneration) stateHolder._selectedImageGenApiConfig.value else stateHolder._selectedApiConfig.value) ?: run {
+            Log.e("MessageSender", "❌ No API config selected! isImageGeneration=$isImageGeneration")
+            viewModelScope.launch { showSnackbar(if (isImageGeneration) "请先选择 图像生成 的API配置" else "请先选择 API 配置") }
+            return
+        }
+
+        // 记录会话使用的配置ID
+        if (!isImageGeneration) {
+            val conversationId = stateHolder._currentConversationId.value
+            stateHolder.conversationApiConfigIds.update { currentMap ->
+                if (currentMap[conversationId] == currentConfig.id) currentMap
+                else currentMap + (conversationId to currentConfig.id)
+            }
+            // 这里仅更新内存状态，HistoryManager.saveCurrentChatToHistoryIfNeededInternal 会负责持久化
+        } else {
+            // 图像模式：绑定当前图像会话ID与配置ID
+            val conversationId = stateHolder._currentImageGenerationConversationId.value
+            stateHolder.conversationApiConfigIds.update { currentMap ->
+                if (currentMap[conversationId] == currentConfig.id) currentMap
+                else currentMap + (conversationId to currentConfig.id)
+            }
+            // 这里仅更新内存状态，HistoryManager 会负责持久化
+        }
+        
+        Log.d("MessageSender", "✅ Using config: ${safeApiConfigSummary(currentConfig)}")
+        Log.d("MessageSender", "=== END SEND MESSAGE DEBUG ===")
+
+        
+        // 详细调试配置信息
+        if (isImageGeneration) {
+            Log.d("MessageSender", "=== IMAGE GEN CONFIG DEBUG ===")
+            Log.d("MessageSender", "Selected config ID: ${currentConfig.id}")
+            Log.d("MessageSender", "ConfigSummary: ${safeApiConfigSummary(currentConfig)}")
+            Log.d("MessageSender", "ModalityType: ${currentConfig.modalityType}")
+        }
+
+        viewModelScope.launch {
+            val effectiveModelChannel = currentConfig.effectiveModelChannel()
+            val parameterProtocol = modelParameterProtocol(effectiveModelChannel)
+            val modelIsGeminiType = parameterProtocol == ModelParameterProtocol.GEMINI
+            val shouldUsePartsApiMessage = modelIsGeminiType
+            val providerForRequestBackend = currentConfig.provider
+            val webSearchEnabledForRequest = !isImageGeneration && stateHolder._isWebSearchEnabled.value
+            val isMcpEnabledForRequest = !isImageGeneration && stateHolder._isMcpEnabledForNextRequest.value
+            val isAgentEnabledForRequest = !isImageGeneration && stateHolder._isAgentEnabled.value
+            val requestConversationId = stateHolder._currentConversationId.value
+            // 每条请求只冻结一次。后续启停和更新从下一条消息生效。
+            val skillSnapshotForRequest = if (isImageGeneration) {
+                null
+            } else {
+                val manualReferences = contentParts.filterIsInstance<MessageContentPart.SkillReference>()
+                    .map { it.reference }
+                withContext(Dispatchers.IO) { skillRepository.createSnapshot(manualReferences) }
+            }
+            // Workspace 准备和附件处理并行。用户消息无需等待 SSH，点击发送后立即进入消息列表。
+            val computerPreparation = async(Dispatchers.IO) {
+                captureComputerPreparation {
+                    prepareComputerRequest(requestConversationId, isAgentEnabledForRequest)
+                }
+            }
+            val enabledToolIdsForRequest = enabledMessageToolIdsForRequest(
+                isImageGeneration = isImageGeneration,
+                webSearchEnabled = webSearchEnabledForRequest,
+                mcpEnabled = isMcpEnabledForRequest,
+                agentEnabled = isAgentEnabledForRequest,
+            )
+            val isDefaultProvider = currentConfig.provider.trim().lowercase() in listOf("默认", "default")
+            val customModelParameters = if (parameterProtocol == ModelParameterProtocol.OPENAI_COMPATIBLE) {
+                try {
+                    currentConfig.modelParameters.openAICompatibleRequestParameters(currentConfig.model)
+                } catch (e: IllegalArgumentException) {
+                    Log.e("MessageSender", "模型参数校验失败", e)
+                    withContext(Dispatchers.Main.immediate) {
+                        showSnackbar(e.message ?: "模型参数无效")
+                    }
+                    return@launch
+                }
+            } else {
+                emptyMap()
+            }
+
+            // 自动注入"上一轮AI出图"作为参考，以支持"在上一张基础上修改"等编辑语义
+            if (isImageGeneration && allAttachments.isEmpty()) {
+                val t = textToActuallySend.lowercase()
+                if (hasImageEditKeywords(t)) {
+                    try {
+                        // 找到最近一条包含图片的AI消息
+                        val lastAiWithImage = stateHolder.imageGenerationMessages.lastOrNull {
+                            it.sender == UiSender.AI && !it.imageUrls.isNullOrEmpty()
+                        }
+                        val refImageUrl = lastAiWithImage?.imageUrls?.lastOrNull()
+                        if (!refImageUrl.isNullOrBlank()) {
+                            val referenceHeaders = buildMap {
+                                currentConfig.key.takeIf { it.isNotBlank() }
+                                    ?.let { put("Authorization", "Bearer $it") }
+                                currentConfig.address.takeIf { it.isNotBlank() }
+                                    ?.let { put("Referer", it) }
+                            }
+                            val referenceResult = imagePersistenceService.persistGeneratedImage(
+                                source = refImageUrl,
+                                messageIdHint = "reference_${UUID.randomUUID().toString().take(8)}",
+                                index = 0,
+                                policy = USER_IMAGE_PERSISTENCE_POLICY,
+                                remoteHeaders = referenceHeaders,
+                                trustedOrigin = currentConfig.address,
+                            )
+                            if (referenceResult is ImagePersistenceResult.Success) {
+                                val referenceFile = File(referenceResult.filePath)
+                                allAttachments.add(
+                                    SelectedMediaItem.ImageFromUri(
+                                        uri = FileProvider.getUriForFile(
+                                            application,
+                                            "${application.packageName}.provider",
+                                            referenceFile,
+                                        ),
+                                        id = "ref_${UUID.randomUUID()}",
+                                        mimeType = referenceResult.mimeType,
+                                        filePath = referenceResult.filePath,
+                                    ),
+                                )
+                                Log.d("MessageSender", "已自动附带上一轮AI图片作为参考: $refImageUrl")
+                            } else {
+                                val reason = (referenceResult as ImagePersistenceResult.Failure).reason
+                                Log.w("MessageSender", "上一轮AI图片未能作为参考: ${reason::class.simpleName}")
+                            }
+                        }
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (e: Exception) {
+                        Log.w("MessageSender", "自动引用上一轮AI图片失败: ${e.message}")
+                    }
+                }
+            }
+
+            val attachmentResult = processAttachments(allAttachments, shouldUsePartsApiMessage, textToActuallySend)
+            if (!attachmentResult.success) {
+                return@launch
+            }
+
+            // Always pass the attachments to the ApiClient.
+            // The ApiClient will handle creating the multipart request.
+            // The previous logic incorrectly sent an empty list for Gemini.
+            val attachmentsForApiClient = attachmentResult.processedAttachmentsForUi
+
+            val newUserMessageForUi = UiMessage(
+                id = manualMessageId ?: "user_${UUID.randomUUID()}", text = textToActuallySend, sender = UiSender.User,
+                contentParts = contentParts,
+                timestamp = System.currentTimeMillis(), contentStarted = true,
+                imageUrls = attachmentResult.imageUriStringsForUi,
+                attachments = attachmentResult.processedAttachmentsForUi,
+                enabledToolIds = enabledToolIdsForRequest,
+                modelName = currentConfig.model,
+                providerName = currentConfig.provider
+            )
+
+            withContext(Dispatchers.Main.immediate) {
+                val animationMap = if (isImageGeneration) stateHolder.imageMessageAnimationStates else stateHolder.textMessageAnimationStates
+                animationMap[newUserMessageForUi.id] = true
+                val messageList = if (isImageGeneration) stateHolder.imageGenerationMessages else stateHolder.messages
+                addOrReplaceRegeneratedUserMessage(
+                    messageList = messageList,
+                    newUserMessage = newUserMessageForUi,
+                    isFromRegeneration = isFromRegeneration,
+                    manualMessageId = manualMessageId,
+                )
+                if (isImageGeneration) {
+                    stateHolder._lastSentImageUserMessageId.value = newUserMessageForUi.id
+                } else {
+                    stateHolder._lastSentUserMessageId.value = newUserMessageForUi.id
+                }
+                if (!isFromRegeneration) {
+                   stateHolder._text.value = ""
+                   stateHolder.clearSelectedMedia()
+                }
+            }
+
+            // 先判断首条消息。Agent 的 AI 加载占位也会进入 messages，不能让它改变会话入库判断。
+            val isNewTextChatFirstMessage = !isImageGeneration &&
+                    isFirstUserMessageForNewChat(
+                        messages = stateHolder.messages,
+                        loadedHistoryIndex = stateHolder._loadedHistoryIndex.value,
+                    )
+
+            val isNewImageChatFirstMessage = isImageGeneration &&
+                    isFirstUserMessageForNewChat(
+                        messages = stateHolder.imageGenerationMessages,
+                        loadedHistoryIndex = stateHolder._loadedImageGenerationHistoryIndex.value,
+                    )
+
+            // Agent 占位会把当前发送协程登记为 textApiJob，因此必须先取消上一条请求。
+            // 自动压缩也需要在读取消息快照前完成清理，避免旧流继续改写上下文。
+            val cancelledActiveTextRequestBeforeSnapshot = !isImageGeneration &&
+                (isAgentEnabledForRequest || currentConfig.modelParameters.autoContextCompressionEnabled)
+            if (cancelledActiveTextRequestBeforeSnapshot) {
+                apiHandler.cancelCurrentApiJob(
+                    reason = "发送新消息，预清理",
+                    isNewMessageSend = true,
+                    isImageGeneration = false,
+                )
+            }
+
+            // Agent 冻结本地 Workspace 快照时立即显示 AI 加载占位，避免短暂准备阶段看起来毫无响应。
+            var preCreatedAiMessageId: String? = if (isAgentEnabledForRequest) {
+                apiHandler.prepareStreamingAiMessage(
+                    modelName = currentConfig.model,
+                    providerName = currentConfig.provider,
+                    isImageGeneration = false,
+                    afterUserMessageId = newUserMessageForUi.id,
+                    executionStatus = "正在准备服务器",
+                    preparationJob = currentCoroutineContext()[Job],
+                )
+            } else {
+                null
+            }
+
+            // 这里只等待本地 Workspace 快照。远端 SSH 准备已在后台继续执行，不阻塞模型首轮响应。
+            // 必须先冻结快照再触发首次会话迁移，否则迁移可能早于 Workspace 映射创建。
+            val computerPreparationResult = computerPreparation.await()
+            val computerPreparationError = computerPreparationResult.exceptionOrNull()
+            if (computerPreparationError != null) {
+                val failureText = (computerPreparationError as? ComputerException)?.message
+                    ?: "Agent 准备失败，请重试"
+                Log.e("MessageSender", "Agent 服务器准备失败", computerPreparationError)
+                val failedMessageId = preCreatedAiMessageId ?: apiHandler.prepareStreamingAiMessage(
+                    modelName = currentConfig.model,
+                    providerName = currentConfig.provider,
+                    isImageGeneration = false,
+                    afterUserMessageId = newUserMessageForUi.id,
+                    preparationJob = currentCoroutineContext()[Job],
+                ).also { preCreatedAiMessageId = it }
+                apiHandler.failPreparedStreamingAiMessage(failedMessageId, failureText)
+                showSnackbar(failureText)
+                return@launch
+            }
+            var preparedComputerRequest = computerPreparationResult.getOrNull()
+            if (isAgentEnabledForRequest && preparedComputerRequest == null) {
+                val failureText = "Agent 本地执行器未初始化"
+                val failedMessageId = preCreatedAiMessageId ?: apiHandler.prepareStreamingAiMessage(
+                    modelName = currentConfig.model,
+                    providerName = currentConfig.provider,
+                    isImageGeneration = false,
+                    afterUserMessageId = newUserMessageForUi.id,
+                    preparationJob = currentCoroutineContext()[Job],
+                ).also { preCreatedAiMessageId = it }
+                apiHandler.failPreparedStreamingAiMessage(failedMessageId, failureText)
+                showSnackbar(failureText)
+                return@launch
+            }
+            if (!isImageGeneration) {
+                preparedComputerRequest = preparedComputerRequest?.let { prepared ->
+                    val stableConversationId = stateHolder._currentConversationId.value
+                    if (prepared.context.conversationId == stableConversationId) {
+                        prepared
+                    } else {
+                        prepared.copy(context = prepared.context.copy(conversationId = stableConversationId))
+                    }
+                }
+                preparedComputerRequest?.let { prepared ->
+                    withContext(Dispatchers.Main.immediate) {
+                        val messageIndex = stateHolder.messages.indexOfFirst { it.id == newUserMessageForUi.id }
+                        if (messageIndex >= 0) {
+                            stateHolder.messages[messageIndex] = stateHolder.messages[messageIndex].copy(
+                                computerIdSnapshot = prepared.context.computerId,
+                                workspaceIdSnapshot = prepared.context.workspaceId,
+                            )
+                        }
+                    }
+                }
+            }
+
+            // Workspace 快照已经冻结，此时再入库并迁移会话 ID，映射不会遗留在临时会话下。
+            if (isNewTextChatFirstMessage || isNewImageChatFirstMessage) {
+                withContext(Dispatchers.IO) {
+                    // AgentRun 使用会话外键。首条消息必须等 chat_sessions 真正落库后再启动 Agent，
+                    // 不能只把保存命令放进队列，否则极快的模型请求会先插入 AgentRun 并触发外键错误。
+                    historyManager.saveCurrentChatToHistoryNow(
+                        forceSave = true,
+                        isImageGeneration = isImageGeneration,
+                    )
+                }
+            }
+
+            withContext(Dispatchers.IO) {
+                val messagesInChatUiSnapshot = if (isImageGeneration) stateHolder.imageGenerationMessages.toList() else stateHolder.messages.toList()
+                logUiMessages("rawMessages", messagesInChatUiSnapshot)
+                val historyEndIndex = messagesInChatUiSnapshot.indexOfFirst { it.id == newUserMessageForUi.id }
+                val historyUiMessagesRaw = ConversationNameHelper.withoutStoredConversationTitle(
+                    if (historyEndIndex != -1) {
+                        messagesInChatUiSnapshot.subList(0, historyEndIndex)
+                    } else {
+                        messagesInChatUiSnapshot
+                    },
+                )
+
+                // 当"系统提示接入"处于暂停状态时，过滤掉会话历史中的系统消息，避免仍然将 Prompt 注入到请求
+                val engagedForThisConversation = stateHolder.systemPromptEngagedState[stateHolder._currentConversationId.value] ?: false
+                val historyUiMessages = if (engagedForThisConversation) {
+                    historyUiMessagesRaw
+                } else {
+                    historyUiMessagesRaw.filter { msg ->
+                        val filteredOut = msg.sender == UiSender.System && !msg.isPlaceholderName
+                        if (filteredOut) {
+                            Log.d(
+                                "MessageSender",
+                                "filteredOutUiMessage: role=${msg.role} reason=systemPromptPaused textChars=${msg.text.length}"
+                            )
+                        }
+                        !filteredOut
+                    }
+                }
+                logUiMessages("filteredMessages", historyUiMessages)
+
+                // 图像会话的稳定会话ID规则：
+                // 第一次消息（historyEndIndex==0 且非从历史加载）时，用"首条用户消息ID"作为 conversationId，
+                // 这样重启后根据第一条消息ID恢复，后端会话可继续（与 SimpleModeManager.loadImageHistory 的写法严格一致）。
+                if (isImageGeneration) {
+                    val isFirstMessageInThisSession = historyEndIndex == 0
+                    val notFromHistory = stateHolder._loadedImageGenerationHistoryIndex.value == null
+                    if (isFirstMessageInThisSession && notFromHistory) {
+                        stateHolder._currentImageGenerationConversationId.value = newUserMessageForUi.id
+                    }
+                }
+
+                // 🔥 修复：使用带Context的toApiMessage方法获取真实MIME类型
+                val historyApiMessages = historyUiMessages.map { it.toApiMessage(uriToBase64Encoder, application) }.toMutableList()
+                logApiMessages("historyApiMessages", historyApiMessages)
+
+                val currentUserApiMessage = if (isImageGeneration) {
+                    newUserMessageForUi.toApiMessage(uriToBase64Encoder, application)
+                } else {
+                    // 当前附件在上下文统计前统一注入，避免图片和音频重复。
+                    SimpleTextApiMessage(
+                        id = newUserMessageForUi.id,
+                        role = newUserMessageForUi.role,
+                        content = newUserMessageForUi.contentParts.toApiText(newUserMessageForUi.text),
+                        name = newUserMessageForUi.name,
+                    )
+                }
+                Log.d(
+                    "MessageSender",
+                    "currentUserApiMessage: role=${currentUserApiMessage.role} summary=${describeApiMessage(currentUserApiMessage)}"
+                )
+
+                val apiMessagesForBackend = ensureUserMessagePresentForRequest(
+                    messages = historyApiMessages,
+                    currentUserMessage = currentUserApiMessage,
+                    currentUserHasAttachments = attachmentsForApiClient.isNotEmpty(),
+                )
+
+                val dispatchCandidates = if (isMcpEnabledForRequest) {
+                    getMcpDispatchCandidates()
+                } else {
+                    emptyList()
+                }
+                // 规范化图像尺寸：为空或包含占位符时回退到 1024x1024（基础兜底）
+                val baseSanitizedImageSize = currentConfig.imageSize?.takeIf { it.isNotBlank() && !it.contains("<") } ?: "1024x1024"
+                
+                // 根据模型家族 + 所选比例，推导 Kolors/Qwen 的精确分辨率（image_size）
+                // - Kolors: 使用映射表或精确选择（含 3:4 的两个选项）
+                // - Qwen-Image: 必须指定推荐分辨率；Qwen-Image-Edit 不支持 image_size（保持 null）
+                val detectedFamilyForImage = com.android.everytalk.ui.components.ImageGenCapabilities.detectFamily(
+                    modelName = currentConfig.model,
+                    provider = currentConfig.provider,
+                    apiAddress = currentConfig.address
+                )
+                val isQwenEditModel = currentConfig.model.contains("Image-Edit", ignoreCase = true)
+                val selectedRatioForImage = stateHolder._selectedImageRatio.value
+                
+                val familyBasedImageSize: String? = when (detectedFamilyForImage) {
+                    com.android.everytalk.ui.components.ImageGenCapabilities.ModelFamily.KOLORS -> {
+                        val labelFromRatio = "${selectedRatioForImage.width}x${selectedRatioForImage.height}"
+                        val mapped = com.android.everytalk.ui.components.ImageGenCapabilities
+                            .getKolorsSizesByRatio(selectedRatioForImage.displayName)
+                            .firstOrNull()?.label
+                        if (mapped.isNullOrBlank()) labelFromRatio else mapped
+                    }
+                    com.android.everytalk.ui.components.ImageGenCapabilities.ModelFamily.QWEN -> {
+                        if (isQwenEditModel) {
+                            null // 按文档：Qwen-Image-Edit 不支持 image_size
+                        } else {
+                            val mapped = com.android.everytalk.ui.components.ImageGenCapabilities
+                                .getQwenSizesByRatio(selectedRatioForImage.displayName)
+                            (mapped.firstOrNull()?.label ?: "1328x1328")
+                        }
+                    }
+                    com.android.everytalk.ui.components.ImageGenCapabilities.ModelFamily.GPT_IMAGE -> {
+                        if (selectedRatioForImage.isAuto) {
+                            null
+                        } else {
+                            com.android.everytalk.ui.components.ImageGenCapabilities
+                                .getGptImageSize(selectedRatioForImage.displayName)
+                                ?.label
+                        }
+                    }
+                    else -> null
+                }
+                
+                val finalImageSize = familyBasedImageSize ?: baseSanitizedImageSize
+                val hasAttachmentImages = attachmentsForApiClient.any {
+                    it is com.android.everytalk.models.SelectedMediaItem.ImageFromUri ||
+                        it is com.android.everytalk.models.SelectedMediaItem.ImageFromBitmap
+                }
+                val imageSizeForRequest: String? = when {
+                    detectedFamilyForImage == com.android.everytalk.ui.components.ImageGenCapabilities.ModelFamily.QWEN && isQwenEditModel -> null
+                    detectedFamilyForImage == com.android.everytalk.ui.components.ImageGenCapabilities.ModelFamily.GPT_IMAGE && selectedRatioForImage.isAuto && hasAttachmentImages -> null
+                    else -> finalImageSize
+                }
+                // 检查是否包含图像生成关键词
+                if (isImageGeneration && hasImageGenerationKeywords(textToActuallySend)) {
+                    // 重置重试计数
+                    stateHolder._imageGenerationRetryCount.value = 0
+                    stateHolder._imageGenerationError.value = null
+                    stateHolder._shouldShowImageGenerationError.value = false
+                }
+
+                val isGeminiChannel = WebSearchSupport.isGeminiNativeSearch(currentConfig)
+                val supportsNativeWebSearch = WebSearchSupport.supportsNativeWebSearch(currentConfig)
+                val selectedExternalProvider = getSelectedExternalWebSearchProvider()
+                val selectedExternalProviderApiKey = getSelectedExternalWebSearchProviderApiKey()
+                val webSearchRouting = WebSearchSupport.resolveWebSearchRouting(
+                    config = currentConfig,
+                    isWebSearchEnabled = webSearchEnabledForRequest,
+                    selectedExternalProvider = selectedExternalProvider,
+                    selectedExternalProviderApiKey = selectedExternalProviderApiKey,
+                )
+                val preparedMcpDispatch = if (isMcpEnabledForRequest && dispatchCandidates.isNotEmpty()) {
+                    prepareMcpDispatch(
+                        messageText = textToActuallySend,
+                        allCandidates = dispatchCandidates,
+                    )
+                } else {
+                    PreparedMcpDispatch(
+                        intent = classifyMcpIntent(textToActuallySend),
+                        tools = emptyList(),
+                    )
+                }
+                val mcpToolsForRequest = preparedMcpDispatch.tools
+                val shouldEnableGoogleSearch = isGeminiChannel && webSearchRouting.useNativeWebSearch
+                val mcpHasSearchTool = mcpToolsForRequest.any { classifyMcpTool(it).isSearchLike }
+                val shouldInjectWebSearchTool = !shouldEnableGoogleSearch && !mcpHasSearchTool
+                        && (webSearchRouting.externalProvider != null || webSearchRouting.useJinaSearch)
+
+                val existingSystemMessageIndex = apiMessagesForBackend.indexOfFirst { it.role == "system" }
+                val existingSystemPrompt = existingSystemMessageIndex.takeIf { it >= 0 }
+                    ?.let { index -> extractPrimaryText(apiMessagesForBackend[index]).trim().takeIf(String::isNotBlank) }
+                val effectiveSystemPrompt = listOfNotNull(
+                    systemPrompt?.trim()?.takeIf(String::isNotBlank) ?: existingSystemPrompt,
+                    preparedComputerRequest?.environmentPrompt,
+                    skillSnapshotForRequest?.renderCatalog(),
+                ).joinToString("\n\n")
+                if (effectiveSystemPrompt.isNotBlank()) {
+                    val systemMessage = SimpleTextApiMessage(role = "system", content = effectiveSystemPrompt)
+                    if (existingSystemMessageIndex != -1) {
+                        apiMessagesForBackend[existingSystemMessageIndex] = systemMessage
+                    } else {
+                        apiMessagesForBackend.add(0, systemMessage)
+                    }
+                }
+
+                val enableCodeExecutionForRequest: Boolean? = if (!isGeminiChannel) {
+                    null
+                } else {
+                    stateHolder._isCodeExecutionEnabled.value
+                }
+                val requestTools = PromptCachePolicy.normalizeTools(run {
+                    val toolsList = mutableListOf<Map<String, Any>>()
+
+                    val customToolsJson = currentConfig.toolsJson
+                    if (!customToolsJson.isNullOrBlank()) {
+                        try {
+                            val jsonElement = Json.parseToJsonElement(customToolsJson)
+                            if (jsonElement is JsonArray) {
+                                jsonElement.forEach { element: JsonElement ->
+                                    if (element is JsonObject) {
+                                        toolsList.add(jsonObjectToMap(element))
+                                    }
+                                }
+                            }
+                        } catch (e: Exception) {
+                            Log.e("MessageSender", "Failed to parse custom tools JSON", e)
+                        }
+                    }
+
+                    if (shouldEnableGoogleSearch) {
+                        Log.d("MessageSender", "启用Google搜索工具用于Gemini渠道")
+                        toolsList.add(mapOf("googleSearch" to emptyMap<String, Any>()))
+                    }
+                    if (isGeminiChannel && stateHolder._isCodeExecutionEnabled.value) {
+                        Log.d("MessageSender", "启用代码执行工具 (code_execution)")
+                        toolsList.add(mapOf("code_execution" to emptyMap<String, Any>()))
+                    }
+                    if (mcpToolsForRequest.isNotEmpty()) {
+                        Log.d("MessageSender", "注入 ${mcpToolsForRequest.size} 个 MCP 工具")
+                        toolsList.addAll(mcpToolsForRequest)
+                    }
+                    if (shouldInjectWebSearchTool) {
+                        Log.d("MessageSender", "注入内建 web_search 工具")
+                        toolsList.add(builtInWebSearchToolDefinition())
+                    }
+                    if (skillSnapshotForRequest?.let {
+                            it.automaticCatalog.isNotEmpty() || it.manualReferences.isNotEmpty()
+                        } == true
+                    ) {
+                        toolsList.addAll(skillToolDefinitions())
+                    }
+
+                    val effectiveTools = appendBuiltInWebFetchToolIfNeeded(toolsList)
+                    if (effectiveTools.size != toolsList.size) {
+                        Log.d("MessageSender", "注入内建 webfetch 工具")
+                    }
+                    val effectiveToolsWithCurrentTime = appendBuiltInCurrentTimeTool(effectiveTools)
+                    if (effectiveToolsWithCurrentTime.size != effectiveTools.size) {
+                        Log.d("MessageSender", "注入内建当前时间工具")
+                    }
+                    val hasGenericAttachments = attachmentsForApiClient.any {
+                        it is SelectedMediaItem.GenericFile
+                    } || historyUiMessages.any { message ->
+                        message.attachments.any { it is SelectedMediaItem.GenericFile }
+                    }
+                    val toolsWithAttachmentReader = appendBuiltInReadAttachmentTool(
+                        tools = effectiveToolsWithCurrentTime,
+                        enabled = hasGenericAttachments,
+                    )
+                    val toolsWithAgentRequest = appendAgentRequestTool(
+                        tools = toolsWithAttachmentReader,
+                        enabled = preparedComputerRequest == null,
+                    )
+                    appendComputerTools(
+                        tools = toolsWithAgentRequest,
+                        enabled = preparedComputerRequest != null,
+                        permissionMode = preparedComputerRequest?.permissionMode
+                            ?: com.android.everytalk.data.computer.ComputerPermissionMode.MANUAL,
+                    ).ifEmpty { null }
+                })
+
+                val tokenLimits = resolvedModelTokenLimits(
+                    maxOutputTokens = currentConfig.maxTokens,
+                    maxContextTokens = currentConfig.modelParameters.maxContextTokens,
+                )
+                // 普通文本的历史与压缩检查点完全由 AgentLoop/Room 管理，旧消息字段只服务图片链路。
+                val restoredCompressionState = if (isImageGeneration) {
+                    historyUiMessages.asReversed()
+                        .mapNotNull(UiMessage::contextCompressionState)
+                        .firstOrNull { it.matchesConfig(currentConfig) }
+                } else {
+                    null
+                }
+                val calibrationSnapshot = historyUiMessages.asReversed().firstOrNull { message ->
+                    message.sender == UiSender.AI &&
+                        message.modelName.equals(currentConfig.model, ignoreCase = true) &&
+                        message.providerName.equals(currentConfig.provider, ignoreCase = true) &&
+                        message.contextUsageSnapshot?.configId == currentConfig.id &&
+                        message.contextUsageSnapshot.measuredInputTokens != null
+                }?.contextUsageSnapshot
+                val inputTokenCalibration = calibrationSnapshot?.let { snapshot ->
+                    checkNotNull(snapshot.measuredInputTokens)
+                        .minus(snapshot.uncalibratedEstimatedInputTokens)
+                        .coerceIn(
+                            -tokenLimits.maxContextTokens.toLong(),
+                            tokenLimits.maxContextTokens.toLong(),
+                        )
+                } ?: 0L
+                val nativeResponsesState = restoredCompressionState?.takeIf {
+                    currentConfig.modelParameters.autoContextCompressionEnabled &&
+                    effectiveModelChannel.contains("codex", ignoreCase = true) &&
+                        isOfficialOpenAIResponsesAddress(currentConfig.address) &&
+                        it.matchesNativeResponsesConfig(currentConfig) &&
+                        !it.openAiResponsesInputJson.isNullOrBlank() &&
+                        !it.openAiResponsesThroughMessageId.isNullOrBlank() &&
+                        historyUiMessages.any { message ->
+                            message.id == it.openAiResponsesThroughMessageId
+                        } &&
+                        runCatching {
+                            Json.parseToJsonElement(checkNotNull(it.openAiResponsesInputJson)) is JsonArray
+                        }.getOrDefault(false)
+                }
+                val nativeAnthropicState = restoredCompressionState?.takeIf {
+                    currentConfig.modelParameters.autoContextCompressionEnabled &&
+                        effectiveModelChannel.contains("anthropic", ignoreCase = true) &&
+                        isOfficialAnthropicMessagesAddress(currentConfig.address) &&
+                        AnthropicDirectClient.isNativeCompactionAvailable(
+                            currentConfig.address,
+                            currentConfig.model,
+                        ) &&
+                        it.matchesNativeAnthropicConfig(currentConfig) &&
+                        !it.anthropicThroughMessageId.isNullOrBlank() &&
+                        historyUiMessages.any { message -> message.id == it.anthropicThroughMessageId } &&
+                        hasSuccessfulAnthropicCompaction(it.anthropicMessagesJson)
+                }
+                val additionalContextTokens = (
+                    nativeResponsesState?.openAiResponsesEstimatedTokens
+                        ?: nativeAnthropicState?.anthropicEstimatedTokens
+                        ?: 0L
+                    ).coerceAtLeast(0L)
+                val nativeThroughMessageId = nativeResponsesState?.openAiResponsesThroughMessageId
+                    ?: nativeAnthropicState?.anthropicThroughMessageId
+                val finalCompressionApplication = try {
+                    val genericAttachmentCount = attachmentsForApiClient.count {
+                        it is SelectedMediaItem.GenericFile
+                    }
+                    val attachmentCharBudget = if (genericAttachmentCount == 0) {
+                        MAX_ATTACHMENT_PAGE_CHARS
+                    } else {
+                        val attachmentInputBudget = tokenLimits.maxContextTokens.toLong() -
+                            tokenLimits.maxOutputTokens.toLong()
+                        val usedBeforeAttachments = calibratedInputTokens(
+                            RequestTokenEstimator.estimate(
+                                apiMessagesForBackend,
+                                requestTools,
+                                additionalContextTokens = additionalContextTokens,
+                            ),
+                            inputTokenCalibration.coerceAtLeast(0L),
+                        )
+                        ((attachmentInputBudget - usedBeforeAttachments - 256L * genericAttachmentCount)
+                            .coerceAtLeast(1L) / genericAttachmentCount)
+                            .coerceAtMost(MAX_ATTACHMENT_PAGE_CHARS.toLong())
+                            .toInt()
+                    }
+                    val messagesWithCurrentAttachments = if (isImageGeneration || attachmentsForApiClient.isEmpty()) {
+                        apiMessagesForBackend
+                    } else {
+                        buildDirectMultimodalRequest(
+                            request = ChatRequest(
+                                messages = apiMessagesForBackend,
+                                provider = providerForRequestBackend,
+                                channel = effectiveModelChannel,
+                                apiAddress = currentConfig.address,
+                                apiKey = currentConfig.key,
+                                model = currentConfig.model,
+                            ),
+                            attachments = attachmentsForApiClient,
+                            context = application,
+                            maxDocumentCharsPerAttachment = attachmentCharBudget,
+                        ).messages
+                    }
+                    val messagesForContextControl = nativeThroughMessageId?.let { throughMessageId ->
+                        val throughIndex = messagesWithCurrentAttachments.indexOfFirst {
+                            it.id == throughMessageId
+                        }
+                        if (throughIndex < 0) {
+                            messagesWithCurrentAttachments
+                        } else {
+                            buildList {
+                                addAll(messagesWithCurrentAttachments.filter {
+                                    it.role.equals("system", ignoreCase = true)
+                                })
+                                addAll(messagesWithCurrentAttachments.drop(throughIndex + 1).filterNot {
+                                    it.role.equals("system", ignoreCase = true)
+                                })
+                            }
+                        }
+                    } ?: messagesWithCurrentAttachments
+                    // 文本请求由统一 AgentLoop 管理完整历史、原子工具组和压缩检查点。
+                    // 图片请求不进入 AgentLoop，只沿用现有上下文窗口裁剪。
+                    val compressionApplication = AutoContextCompressionApplication(messagesForContextControl)
+                    val fittedMessages = if (isImageGeneration) {
+                        trimMessagesToContextWindow(
+                            messages = compressionApplication.messages,
+                            limits = tokenLimits,
+                            tools = requestTools,
+                            inputTokenCalibration = inputTokenCalibration,
+                            additionalContextTokens = additionalContextTokens,
+                        )
+                    } else {
+                        messagesForContextControl
+                    }
+                    compressionApplication.copy(messages = fittedMessages)
+                } catch (error: CancellationException) {
+                    throw error
+                } catch (error: Exception) {
+                    if (isImageGeneration) throw error
+                    val failureText = contextCompressionFailureText(error)
+                    if (preCreatedAiMessageId == null) {
+                        preCreatedAiMessageId = apiHandler.prepareStreamingAiMessage(
+                            modelName = currentConfig.model,
+                            providerName = currentConfig.provider,
+                            isImageGeneration = false,
+                            afterUserMessageId = newUserMessageForUi.id,
+                            executionStatus = failureText,
+                            preparationJob = currentCoroutineContext()[Job],
+                        )
+                    }
+                    apiHandler.failPreparedStreamingAiMessage(
+                        messageId = checkNotNull(preCreatedAiMessageId),
+                        errorText = failureText,
+                    )
+                    Log.e("MessageSender", failureText, error)
+                    return@withContext
+                }
+                val finalApiMessages = finalCompressionApplication.messages
+                val activeCompressionState = finalCompressionApplication.state
+                val contextUsageSnapshot = RequestTokenEstimator.estimate(
+                    messages = finalApiMessages,
+                    tools = requestTools,
+                    additionalContextTokens = additionalContextTokens,
+                ).toContextUsageSnapshot(
+                    messageId = "",
+                    configId = currentConfig.id,
+                    reservedOutputTokens = tokenLimits.maxOutputTokens.toLong(),
+                    contextWindowTokens = tokenLimits.maxContextTokens.toLong(),
+                    inputCalibrationTokens = inputTokenCalibration,
+                )
+                logApiMessages("finalMessages", finalApiMessages)
+
+                if (finalApiMessages.isEmpty() || finalApiMessages.lastOrNull()?.role != "user") {
+                    withContext(Dispatchers.Main.immediate) {
+                        stateHolder.messages.remove(newUserMessageForUi)
+                        val animationMap = if (isImageGeneration) stateHolder.imageMessageAnimationStates else stateHolder.textMessageAnimationStates
+                        animationMap.remove(newUserMessageForUi.id)
+                    }
+                    return@withContext
+                }
+
+                Log.d(
+                    "MessageSender",
+                    "config=${safeApiConfigSummary(currentConfig)}, supportsNativeWebSearch: $supportsNativeWebSearch, webSearchEnabled: $webSearchEnabledForRequest, shouldEnableGoogleSearch: $shouldEnableGoogleSearch, externalProvider=${webSearchRouting.externalProvider?.providerId}"
+                )
+
+                // 在自动压缩或外部联网搜索开始时复用同一个普通加载占位消息。
+                if (!isImageGeneration && preCreatedAiMessageId == null) {
+                    if (!cancelledActiveTextRequestBeforeSnapshot) {
+                        apiHandler.cancelCurrentApiJob("发送新消息，预清理", isNewMessageSend = true, isImageGeneration = false)
+                    }
+                    preCreatedAiMessageId = apiHandler.prepareStreamingAiMessage(
+                        modelName = currentConfig.model,
+                        providerName = currentConfig.provider,
+                        isImageGeneration = false,
+                        afterUserMessageId = newUserMessageForUi.id,
+                        contextUsageSnapshot = contextUsageSnapshot,
+                        contextCompressionState = activeCompressionState,
+                    )
+                }
+                if (!isImageGeneration && preCreatedAiMessageId != null) {
+                    apiHandler.updatePreparedStreamingStatus(
+                        messageId = checkNotNull(preCreatedAiMessageId),
+                        status = null,
+                        contextUsageSnapshot = contextUsageSnapshot,
+                        contextCompressionState = activeCompressionState,
+                    )
+                }
+
+                val chatRequestForApi = ChatRequest(
+                    messages = finalApiMessages,
+                    provider = providerForRequestBackend,
+                    channel = effectiveModelChannel,
+                    apiAddress = currentConfig.address,
+                    apiKey = currentConfig.key,
+                    model = currentConfig.model,
+                    deviceId = com.android.everytalk.util.DeviceIdManager.getDeviceId(application),
+                    conversationId = stateHolder._currentConversationId.value,
+                    useWebSearch = webSearchRouting.useNativeWebSearch,
+                    // 显式传递代码执行开关状态
+                    enableCodeExecution = enableCodeExecutionForRequest,
+                    generationConfig = GenerationConfig(
+                        temperature = currentConfig.temperature,
+                        topP = currentConfig.topP,
+                        maxOutputTokens = tokenLimits.maxOutputTokens,
+                        thinkingConfig = currentConfig.modelParameters.toThinkingConfig(
+                            channel = effectiveModelChannel,
+                            model = currentConfig.model,
+                        )
+                    ).let { if (it.temperature != null || it.topP != null || it.maxOutputTokens != null || it.thinkingConfig != null) it else null },
+                    qwenEnableSearch = if (WebSearchSupport.shouldEnableQwenNativeSearch(currentConfig, webSearchRouting.useNativeWebSearch)) true else null,
+                    customModelParameters = customModelParameters.ifEmpty { null },
+                    tools = requestTools,
+                    contextManagement = RequestContextManagement(
+                        configId = currentConfig.id,
+                        maxContextTokens = tokenLimits.maxContextTokens,
+                        reservedOutputTokens = tokenLimits.maxOutputTokens,
+                        compactThresholdTokens = tokenLimits.maxContextTokens.toLong() *
+                            currentConfig.modelParameters.autoContextCompressionThresholdPercent
+                                .coerceAtMost(MAX_AUTO_CONTEXT_COMPRESSION_THRESHOLD_PERCENT) / 100L,
+                        autoCompressionEnabled = currentConfig.modelParameters.autoContextCompressionEnabled,
+                        inputTokenCalibration = inputTokenCalibration,
+                        estimatedInputTokens = contextUsageSnapshot.estimatedInputTokens,
+                        restoredState = activeCompressionState,
+                        restoredStateCoversRequestPrefix = nativeThroughMessageId != null,
+                    ),
+                    localComputerRequestContext = preparedComputerRequest?.context,
+                    localSkillSnapshot = skillSnapshotForRequest,
+                    imageGenRequest = if (isImageGeneration) {
+                        // 调试信息：检查发送的配置
+                        Log.d("MessageSender", "Image generation config: ${safeApiConfigSummary(currentConfig)}")
+                        
+                        // 计算上游完整图片生成端点（默认平台交由后端注入，避免相对路径）
+                        val upstreamApiForImageGen = if (isDefaultProvider) {
+                            ""
+                        } else {
+                            val upstreamBase = currentConfig.address.trim().trimEnd('/')
+                            if (upstreamBase.endsWith("/v1/images/generations")) {
+                                upstreamBase
+                            } else {
+                                "$upstreamBase/v1/images/generations"
+                            }
+                        }
+
+                        // 构建"无状态历史摘要"，保证每个会话自带记忆（即使后端会话未命中）
+                        // 仅提取纯文本轮次（user/model），避免把图片当作历史内容。
+                        val historyForStatelessMemory: List<Map<String, String>> = run {
+                            val maxTurns = 6 // 最近6轮（user/model合计），可按需调整
+                            val turns = mutableListOf<Map<String, String>>()
+                            historyUiMessages
+                                .asReversed() // 从末尾向前
+                                .asSequence()
+                                .filter { it.text.isNotBlank() }
+                                .map { msg ->
+                                    val role = if (msg.sender == UiSender.User) "user" else "model"
+                                    role to msg.text.trim()
+                                }
+                                .filter { (_, text) -> text.isNotBlank() }
+                                .take(maxTurns)
+                                .toList()
+                                .asReversed() // 恢复正序
+                                .forEach { (role, text) ->
+                                    turns.add(mapOf("role" to role, "text" to text))
+                                }
+                            turns
+                        }
+
+                        // 依据文档：通过 config.response_modalities 与 image_config.aspect_ratio 控制输出
+                        ImageGenRequest(
+                            model = currentConfig.model,
+                            prompt = textToActuallySend,
+                            imageSize = imageSizeForRequest, // Kolors/Qwen 生效；Qwen-Image-Edit 禁用
+                            batchSize = 1,
+                            numInferenceSteps = currentConfig.numInferenceSteps,
+                            guidanceScale = currentConfig.guidanceScale,
+                            // 默认平台：apiAddress/apiKey 留空，由后端从 .env 注入
+                            apiAddress = if (isDefaultProvider) "" else upstreamApiForImageGen,
+                            apiKey = if (isDefaultProvider) "" else currentConfig.key,
+                            // 渠道控制路由：默认平台传"默认"，非默认按"渠道"字段（OpenAI兼容/Gemini）
+                            provider = if (isDefaultProvider) currentConfig.provider else effectiveModelChannel,
+                            responseModalities = listOf("Image"),
+                            aspectRatio = stateHolder._selectedImageRatio.value.let { r ->
+                                if (r.isAuto) null else r.displayName
+                            },
+                            // 严格会话隔离：把当前图像历史项ID透传到后端
+                            conversationId = stateHolder._currentImageGenerationConversationId.value,
+                            // 额外兜底：把最近若干轮文本摘要也发给后端，确保"该会话独立记忆"不依赖服务端状态
+                            history = historyForStatelessMemory.ifEmpty { null },
+                            // 禁用水印（针对 Seedream 直连）
+                            watermark = false,
+                            // 将配置中的 imageSize (1K/2K/4K) 传递给 Gemini 专用字段
+                            geminiImageSize = if (modelIsGeminiType) currentConfig.imageSize else null,
+                            quality = if (detectedFamilyForImage == com.android.everytalk.ui.components.ImageGenCapabilities.ModelFamily.GPT_IMAGE) {
+                                stateHolder._gptImageQuality.value.apiValue
+                            } else null
+                        )
+                    } else null
+                )
+
+                Log.d(
+                    "MessageSender",
+                    "Prompt tool profile=${PromptCachePolicy.toolProfile(chatRequestForApi.tools)} " +
+                        "schema=${PromptCachePolicy.toolSchemaHash(chatRequestForApi.tools).take(16)}",
+                )
+                PromptCachePolicy.logToolProfile(chatRequestForApi.tools)
+
+                apiHandler.streamChatResponse(
+                    requestBody = chatRequestForApi,
+                    attachmentsToPassToApiClient = if (isImageGeneration) attachmentsForApiClient else emptyList(),
+                    applicationContextForApiClient = application,
+                    userMessageTextForContext = textToActuallySend,
+                    afterUserMessageId = newUserMessageForUi.id,
+                    onMessagesProcessed = {
+                        // 避免图像模式在AI占位阶段过早入库，仅文本模式此处保存
+                        if (!isImageGeneration) {
+                            viewModelScope.launch {
+                                historyManager.saveCurrentChatToHistoryIfNeeded(isImageGeneration = false)
+                            }
+                        }
+                    },
+                    onRequestFailed = { error ->
+                        viewModelScope.launch(Dispatchers.Main) {
+                            val errorMessage = "发送失败: ${error.message ?: "未知错误"}"
+                            showSnackbar(errorMessage)
+                        }
+                    },
+                    onNewAiMessageAdded = triggerScrollToBottom,
+                    audioBase64 = if (isImageGeneration) audioBase64 else null,
+                    mimeType = mimeType,
+                    isImageGeneration = isImageGeneration,
+                    preCreatedAiMessageId = preCreatedAiMessageId,
+                    contextUsageSnapshot = if (isImageGeneration) null else contextUsageSnapshot,
+                )
+            }
+        }
+    }
+

@@ -1,0 +1,1023 @@
+package com.android.everytalk.ui.screens.BubbleMain.Main
+import com.android.everytalk.statecontroller.*
+
+import android.content.Intent
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.*
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.scaleIn
+import androidx.compose.animation.scaleOut
+import kotlinx.coroutines.launch
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.isSystemInDarkTheme
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.layout.FlowRow
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.input.nestedscroll.nestedScroll
+import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
+import androidx.compose.ui.input.nestedscroll.NestedScrollSource
+import androidx.compose.ui.unit.Velocity
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.animation.animateContentSize
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.ContentCopy
+import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.ExpandMore
+import androidx.compose.material.icons.filled.ExpandLess
+import androidx.compose.foundation.clickable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.ui.draw.drawWithContent
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.TileMode
+import androidx.compose.material.icons.outlined.Archive
+import androidx.compose.material.icons.outlined.AttachFile
+import androidx.compose.material.icons.outlined.Audiotrack
+import androidx.compose.material.icons.outlined.Description
+import androidx.compose.material.icons.outlined.Image
+import androidx.compose.material.icons.outlined.PictureAsPdf
+import androidx.compose.material.icons.outlined.Slideshow
+import androidx.compose.material.icons.outlined.TableChart
+import androidx.compose.material.icons.outlined.Videocam
+import androidx.compose.material.icons.outlined.Download
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.platform.LocalWindowInfo
+import androidx.compose.ui.res.pluralStringResource
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.foundation.text.InlineTextContent
+import androidx.compose.foundation.text.appendInlineContent
+import androidx.compose.ui.text.Placeholder
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.PlaceholderVerticalAlign
+import androidx.compose.ui.text.PlatformTextStyle
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.style.Hyphens
+import androidx.compose.ui.text.style.LineBreak
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.unit.TextUnit
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.PopupProperties
+import com.android.everytalk.data.DataClass.Message
+import com.android.everytalk.data.DataClass.MessageContentPart
+import com.android.everytalk.R
+import com.android.everytalk.data.DataClass.Sender
+import com.android.everytalk.models.SelectedMediaItem
+import com.android.everytalk.ui.components.ChatMarkdownTextStyle
+import com.android.everytalk.ui.components.ProportionalAsyncImage
+import com.android.everytalk.ui.components.ImagePreviewDialog
+import com.android.everytalk.ui.components.popup.AppFloatingCardPopup
+import com.android.everytalk.ui.components.streaming.StreamBlockParser
+import com.android.everytalk.ui.components.streaming.UnifiedMarkdownRenderer
+import com.android.everytalk.ui.components.streaming.contentVersionForRendering
+
+private val CONTEXT_MENU_ITEM_ICON_SIZE = 22.dp
+// Markdown 字形视觉重心偏下，用户气泡只移动内容绘制位置，不改变气泡尺寸。
+private val USER_BUBBLE_TEXT_OPTICAL_OFFSET = (-8).dp
+
+internal fun attachmentStripHorizontalAlignment(sender: Sender): Alignment.Horizontal =
+    if (sender == Sender.User) Alignment.End else Alignment.Start
+
+internal data class AttachmentThumbnailSize(
+    val widthDp: Float,
+    val heightDp: Float,
+)
+
+internal fun fitAttachmentThumbnail(
+    sourceWidth: Float,
+    sourceHeight: Float,
+    maxWidthDp: Float = 160f,
+    maxHeightDp: Float = 100f,
+): AttachmentThumbnailSize {
+    if (
+        !sourceWidth.isFinite() ||
+        !sourceHeight.isFinite() ||
+        sourceWidth <= 0f ||
+        sourceHeight <= 0f
+    ) {
+        return AttachmentThumbnailSize(maxHeightDp, maxHeightDp)
+    }
+    val scale = minOf(maxWidthDp / sourceWidth, maxHeightDp / sourceHeight)
+    return AttachmentThumbnailSize(
+        widthDp = sourceWidth * scale,
+        heightDp = sourceHeight * scale,
+    )
+}
+
+internal fun attachmentImageBorderColor(onSurface: Color): Color =
+    onSurface.copy(alpha = 0.45f)
+
+internal const val USER_BUBBLE_COLLAPSED_MAX_HEIGHT_RATIO = 0.32f
+internal const val USER_BUBBLE_EXPANDED_MAX_HEIGHT_RATIO = 0.56f
+
+internal fun resolveUserBubbleMaxHeightDp(
+    screenHeightDp: Float,
+    isExpanded: Boolean,
+): Float = screenHeightDp * if (isExpanded) {
+    USER_BUBBLE_EXPANDED_MAX_HEIGHT_RATIO
+} else {
+    USER_BUBBLE_COLLAPSED_MAX_HEIGHT_RATIO
+}
+
+internal fun shouldConstrainUserBubbleHeight(
+    sender: Sender,
+    hasOverflow: Boolean,
+    isExpanded: Boolean,
+): Boolean = sender == Sender.User && (!isExpanded || hasOverflow)
+
+internal fun resolveUserBubbleContentBottomPaddingDp(
+    sender: Sender,
+    isExpanded: Boolean,
+): Float = if (sender == Sender.User && isExpanded) 28f else 0f
+
+
+@Composable
+internal fun UserOrErrorMessageContent(
+    message: Message,
+    displayedText: String,
+    showLoadingDots: Boolean,
+    bubbleColor: Color,
+    contentColor: Color,
+    isError: Boolean,
+    maxWidth: Dp,
+    onLongPress: (Message, Offset) -> Unit,
+    modifier: Modifier = Modifier,
+    scrollStateManager: com.android.everytalk.ui.screens.MainScreen.chat.text.state.ChatScrollStateManager
+) {
+    val haptic = LocalHapticFeedback.current
+    val currentMessage by rememberUpdatedState(message)
+    val currentOnLongPress by rememberUpdatedState(onLongPress)
+    var globalPosition by remember { mutableStateOf(Offset.Zero) }
+    val renderText = displayedText.ifBlank { message.text }
+    val preparedMessage = remember(message.id, renderText) {
+        StreamBlockParser.prepareMessage(
+            content = renderText,
+            messageId = message.id,
+            contentVersion = contentVersionForRendering(renderText),
+        )
+    }
+
+    // 基于发送者动态计算最大宽度：用户71%，AI80%
+    val windowSize = LocalWindowInfo.current.containerSize
+    val density = LocalDensity.current
+    val screenDp = with(density) { windowSize.width.toDp() }
+    val bubbleShape = RoundedCornerShape(
+        topStart = 18.dp,
+        topEnd = 0.dp,
+        bottomStart = 18.dp,
+        bottomEnd = 18.dp
+    )
+    
+    // 用户气泡最大约 71% 屏宽，AI 气泡放宽到约 98% 屏宽，尽量贴近屏幕两侧
+    val roleMax = if (message.sender == Sender.User) screenDp * 0.71f else screenDp * 0.98f
+    val appliedMax = roleMax.coerceAtMost(maxWidth)
+
+    Box(
+        modifier = modifier
+            .wrapContentWidth()
+            .padding(vertical = 2.dp)
+    ) {
+        Surface(
+            color = bubbleColor,
+            contentColor = contentColor,
+            shape = RoundedCornerShape(
+                topStart = 18.dp,
+                topEnd = 0.dp,     // 右上角不要圆角
+                bottomStart = 18.dp,
+                bottomEnd = 18.dp
+            ),
+            tonalElevation = if (isError) 0.dp else 1.dp,
+            modifier = Modifier
+                .wrapContentWidth()                 // 以内容宽度为准
+                .widthIn(max = appliedMax)          // 用户气泡最大71%，AI气泡最大80%
+                .onGloballyPositioned { coordinates -> 
+                    // 存储组件在屏幕中的全局位置
+                    globalPosition = coordinates.localToRoot(Offset.Zero)
+                }
+                // 🔥 修复：将长按手势移至 Surface 层，移除覆盖在内容上的透明 Box
+                // 这样内部组件（如表格）的触摸事件就不会被覆盖层拦截
+                .pointerInput(message.id, isError) {
+                    detectTapGestures(
+                        onLongPress = { localOffset ->
+                            haptic.performHapticFeedback(
+                                androidx.compose.ui.hapticfeedback.HapticFeedbackType.LongPress
+                            )
+                            // localOffset 是相对于 Surface 的，加上 globalPosition 即可
+                            val globalOffset = globalPosition + localOffset
+                            currentOnLongPress(currentMessage, globalOffset)
+                        }
+                    )
+                }
+        ) {
+            // 展开/收起状态管理
+            var isExpanded by remember(message.id) { mutableStateOf(false) }
+            var hasOverflow by remember(message.id) { mutableStateOf(false) }
+            val contentScrollState = rememberScrollState()
+            val maxUserBubbleHeight = resolveUserBubbleMaxHeightDp(
+                screenHeightDp = with(density) { windowSize.height.toDp().value },
+                isExpanded = isExpanded,
+            ).dp
+            val constrainUserBubbleHeight = shouldConstrainUserBubbleHeight(
+                sender = message.sender,
+                hasOverflow = hasOverflow,
+                isExpanded = isExpanded,
+            )
+
+            LaunchedEffect(isExpanded, message.id) {
+                if (!isExpanded) {
+                    contentScrollState.scrollTo(0)
+                }
+            }
+            
+            // 使用 Box 作为主容器，让按钮浮动在底部
+            Box(
+                modifier = Modifier
+                    // 用户保持原来略紧凑，AI 左右仅保留 1dp 安全边距
+                    .padding(
+                        horizontal = if (message.sender == Sender.User) 0.dp else 1.dp,
+                        vertical = if (message.sender == Sender.User) 0.dp else 14.dp
+                    )
+                    .wrapContentWidth()
+                    .defaultMinSize(minHeight = 28.dp),
+                contentAlignment = Alignment.CenterStart
+            ) {
+                Box(
+                    modifier = Modifier
+                        .wrapContentWidth()
+                        .animateContentSize() // 🔥 添加流畅的过渡动画
+                        .then(
+                            if (constrainUserBubbleHeight) {
+                                Modifier
+                                    .heightIn(max = maxUserBubbleHeight)
+                                    .then(
+                                        if (isExpanded && hasOverflow) {
+                                            Modifier.verticalScroll(contentScrollState)
+                                        } else {
+                                            Modifier
+                                        }
+                                    )
+                                    .drawWithContent {
+                                        drawContent()
+                                        // 简单检测：如果绘制高度达到了最大限制，认为有溢出
+                                        if (!isExpanded) {
+                                            hasOverflow = size.height >= maxUserBubbleHeight.toPx() - 1f
+                                        }
+                                    }
+                            } else {
+                                Modifier
+                            }
+                        ),
+                    contentAlignment = Alignment.CenterStart
+                ) {
+                    // 原有内容层
+                    Box(
+                        contentAlignment = Alignment.CenterStart,
+                        modifier = Modifier
+                            .wrapContentWidth()
+                            .padding(
+                                start = if (message.sender == Sender.User) 10.dp else 0.dp,
+                                end = if (message.sender == Sender.User) 10.dp else 0.dp,
+                                top = if (message.sender == Sender.User) 6.dp else 0.dp,
+                                bottom = if (message.sender == Sender.User) 6.dp else 0.dp,
+                            )
+                            // 如果显示按钮，给底部留出空间，防止内容被按钮遮挡
+                            .padding(
+                                bottom = resolveUserBubbleContentBottomPaddingDp(
+                                    sender = message.sender,
+                                    isExpanded = isExpanded,
+                                ).dp
+                            )
+                    ) {
+                        if (showLoadingDots && !isError) {
+                            ThreeDotsLoadingAnimation(
+                                dotColor = contentColor,
+                                modifier = Modifier
+                                    .align(Alignment.Center)
+                                    .offset(y = (-6).dp)
+                            )
+                        } else if (
+                            message.sender == Sender.User &&
+                            message.contentParts.any { it is MessageContentPart.SkillReference }
+                        ) {
+                            UserMessageWithSkillTags(message.contentParts, contentColor)
+                        } else if (renderText.isNotBlank() || isError) {
+                            UnifiedMarkdownRenderer(
+                                preparedMessage = preparedMessage,
+                                sender = message.sender,
+                                modifier = Modifier
+                                    .wrapContentWidth()
+                                    .offset(
+                                        y = if (message.sender == Sender.User) {
+                                            USER_BUBBLE_TEXT_OPTICAL_OFFSET
+                                        } else {
+                                            0.dp
+                                        }
+                                    ),
+                            )
+                        }
+                    }
+                }
+                
+                // 展开/收起按钮 - 浮动在底部，带有渐变背景
+                if (message.sender == Sender.User && (hasOverflow || isExpanded)) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .align(Alignment.BottomCenter)
+                            // 显式裁剪为底部圆角，解决点击波纹直角问题，匹配气泡圆角
+                            .clip(bubbleShape)
+                            .background(
+                                brush = Brush.verticalGradient(
+                                    colors = listOf(
+                                        bubbleColor.copy(alpha = 0f), // 顶部透明
+                                        bubbleColor.copy(alpha = 0.8f), // 中间过渡
+                                        bubbleColor                   // 底部实色
+                                    )
+                                )
+                            )
+                            .clickable { isExpanded = !isExpanded }
+                            .padding(vertical = 9.dp),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(
+                            imageVector = if (isExpanded) Icons.Filled.ExpandLess else Icons.Filled.ExpandMore,
+                            contentDescription = stringResource(
+                                if (isExpanded) R.string.action_collapse else R.string.action_expand,
+                            ),
+                            tint = contentColor.copy(alpha = 0.7f),
+                            modifier = Modifier.size(20.dp)
+                        )
+                    }
+                }
+            }
+        }
+
+    }
+}
+
+/** 历史数据可能在 Skill 标签后保存了多个空格；显示时统一压成一个标准间距。 */
+internal fun normalizeSkillTagFollowingText(text: String): String {
+    val trimmed = text.dropWhile { it == ' ' || it == '\t' }
+    return when {
+        trimmed.length == text.length -> text
+        trimmed.isEmpty() -> ""
+        else -> " $trimmed"
+    }
+}
+
+/** 历史消息按原位置显示一次性 Skill 标签，引用本身仍由 contentParts 持久化。 */
+@Composable
+private fun UserMessageWithSkillTags(
+    parts: List<MessageContentPart>,
+    contentColor: Color,
+) {
+    val density = LocalDensity.current
+    val textMeasurer = androidx.compose.ui.text.rememberTextMeasurer()
+    val textStyle = MaterialTheme.typography.bodyLarge
+    val inlineContent = remember(parts, contentColor, density) {
+        buildMap<String, InlineTextContent> {
+            parts.filterIsInstance<MessageContentPart.SkillReference>().forEachIndexed { index, part ->
+                val key = "skill-$index"
+                val name = part.reference.displayName
+                val measuredWidthPx = textMeasurer.measure(
+                    text = AnnotatedString(name),
+                    style = TextStyle(fontSize = 12.sp, fontWeight = FontWeight.Medium),
+                ).size.width
+                val tagWidthDp = with(density) { (measuredWidthPx + 16.dp.toPx()).toDp() }
+                put(
+                    key,
+                    InlineTextContent(
+                        placeholder = Placeholder(
+                            width = tagWidthDp.value.sp,
+                            height = 22.sp,
+                            placeholderVerticalAlign = PlaceholderVerticalAlign.Center,
+                        ),
+                    ) {
+                        Surface(
+                            modifier = Modifier.fillMaxSize(),
+                            shape = RoundedCornerShape(percent = 50),
+                            color = MaterialTheme.colorScheme.primary.copy(alpha = 0.14f),
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .padding(horizontal = 8.dp),
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                Text(
+                                    text = name,
+                                    modifier = Modifier.fillMaxWidth(),
+                                    color = contentColor,
+                                    fontSize = 12.sp,
+                                    fontWeight = FontWeight.Medium,
+                                    textAlign = TextAlign.Center,
+                                    style = TextStyle(
+                                        platformStyle = PlatformTextStyle(includeFontPadding = false),
+                                    ),
+                                    maxLines = 1,
+                                )
+                            }
+                        }
+                    },
+                )
+            }
+        }
+    }
+    val text = remember(parts) {
+        AnnotatedString.Builder().apply {
+            var skillIndex = 0
+            var previousWasSkill = false
+            parts.forEach { part ->
+                when (part) {
+                    is MessageContentPart.Text -> {
+                        append(part.text)
+                        previousWasSkill = false
+                    }
+                    is MessageContentPart.SkillReference -> {
+                        appendInlineContent("skill-${skillIndex++}", "/${part.reference.displayName}")
+                        previousWasSkill = true
+                    }
+                }
+            }
+        }.toAnnotatedString()
+    }
+    Text(
+        text = text,
+        inlineContent = inlineContent,
+        color = contentColor,
+        style = MaterialTheme.typography.bodyLarge,
+    )
+}
+
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+fun AttachmentsContent(
+    attachments: List<SelectedMediaItem>,
+    onAttachmentClick: (SelectedMediaItem) -> Unit,
+    maxWidth: Dp,
+    message: Message,
+    onEditRequest: (Message) -> Unit,
+    onRegenerateRequest: (Message) -> Unit,
+    onLongPress: (Message, Offset) -> Unit,
+    onImageLoaded: () -> Unit,
+    scrollStateManager: com.android.everytalk.ui.screens.MainScreen.chat.text.state.ChatScrollStateManager,
+    bubbleColor: Color = MaterialTheme.colorScheme.surfaceVariant,
+    isAiGenerated: Boolean = false,  // 新增参数标识是否为AI生成
+    onImageClick: ((String) -> Unit)? = null   // 新增：图片点击放大回调
+) {
+    val context = LocalContext.current
+    val haptic = LocalHapticFeedback.current
+    val currentMessage by rememberUpdatedState(message)
+    val currentOnImageClick by rememberUpdatedState(onImageClick)
+    val currentOnLongPress by rememberUpdatedState(onLongPress)
+    var previewUrlInternal by remember(message.id) { mutableStateOf<String?>(null) }
+    val fallbackAttachmentName = stringResource(R.string.attachment_generic_fallback)
+
+    // 附件区域也跟随相同的最大宽度限制
+    val screenDp = with(LocalDensity.current) { LocalWindowInfo.current.containerSize.width.toDp() }
+    val roleMax = if (message.sender == Sender.User) screenDp * 0.6f else screenDp * 0.8f
+    val attachmentsAppliedMax = roleMax.coerceAtMost(maxWidth)
+
+    val imageAttachments = remember(attachments) {
+        attachments.filter { it is SelectedMediaItem.ImageFromUri || it is SelectedMediaItem.ImageFromBitmap }
+    }
+    val nonImageAttachments = remember(attachments) {
+        attachments.filter { it is SelectedMediaItem.GenericFile || it is SelectedMediaItem.Audio }
+    }
+
+    val attachmentHorizontalAlignment = attachmentStripHorizontalAlignment(message.sender)
+
+    Column(
+        modifier = Modifier.padding(top = 8.dp),
+        horizontalAlignment = attachmentHorizontalAlignment
+    ) {
+        if (imageAttachments.isNotEmpty() && isAiGenerated) {
+            // AI 生成的图片：等比例缩放，填满可用宽度
+            Column(
+                modifier = Modifier.fillMaxWidth(),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                imageAttachments.forEach { attachment ->
+                    var imageGlobalPosition by remember(attachment.id) { mutableStateOf(Offset.Zero) }
+                    val imageModel: Any = remember(attachment) {
+                        when (attachment) {
+                            is SelectedMediaItem.ImageFromUri -> attachment.filePath?.takeIf { it.isNotBlank() }
+                                ?: if (attachment.uri.scheme == "data") attachment.uri.toString() else attachment.uri
+                            is SelectedMediaItem.ImageFromBitmap -> attachment.model
+                            else -> ""
+                        }
+                    }
+                    val currentImageModel by rememberUpdatedState(imageModel)
+                    coil3.compose.AsyncImage(
+                        model = imageModel,
+                        contentDescription = stringResource(R.string.attachment_generated_image),
+                        contentScale = androidx.compose.ui.layout.ContentScale.FillWidth,
+                        onSuccess = { onImageLoaded() },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(12.dp))
+                            .onGloballyPositioned { imageGlobalPosition = it.localToRoot(Offset.Zero) }
+                            .pointerInput(message.id, attachment.id) {
+                                detectTapGestures(
+                                    onTap = {
+                                        val url = currentImageModel.toString()
+                                        if (url.isNotBlank()) {
+                                            currentOnImageClick?.invoke(url) ?: run { previewUrlInternal = url }
+                                        }
+                                    },
+                                    onLongPress = { localOffset ->
+                                        haptic.performHapticFeedback(androidx.compose.ui.hapticfeedback.HapticFeedbackType.LongPress)
+                                        currentOnLongPress(currentMessage, imageGlobalPosition + localOffset)
+                                    }
+                                )
+                            }
+                    )
+                }
+            }
+        } else if (imageAttachments.isNotEmpty()) {
+            val imageStripHeight = 100.dp
+            val imageShape = RoundedCornerShape(12.dp)
+            val imageBorderColor = attachmentImageBorderColor(MaterialTheme.colorScheme.onSurface)
+            val scrollState = rememberScrollState()
+            val canScrollBackward by remember {
+                derivedStateOf { scrollState.value > 0 }
+            }
+            val canScrollForward by remember {
+                derivedStateOf { scrollState.value < scrollState.maxValue }
+            }
+            val isUser = message.sender == Sender.User
+
+            LaunchedEffect(isUser, imageAttachments.size, scrollState.maxValue) {
+                if (isUser) scrollState.scrollTo(scrollState.maxValue)
+            }
+
+            val fadeColor = if (androidx.compose.foundation.isSystemInDarkTheme()) Color.Black else Color.White
+
+            Box(modifier = Modifier.fillMaxWidth()) {
+                Row(
+                    horizontalArrangement = if (isUser) Arrangement.spacedBy(2.dp, Alignment.End) else Arrangement.spacedBy(2.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier
+                        .height(imageStripHeight)
+                        .fillMaxWidth()
+                        .horizontalScroll(scrollState)
+                ) {
+                    imageAttachments.forEach { attachment ->
+                        var imageGlobalPosition by remember(attachment.id) { mutableStateOf(Offset.Zero) }
+                        var thumbnailSize by remember(attachment.id) {
+                            mutableStateOf(AttachmentThumbnailSize(100f, 100f))
+                        }
+                        val imageModel: Any = remember(attachment) { when (attachment) {
+                            is SelectedMediaItem.ImageFromUri -> attachment.filePath?.takeIf { it.isNotBlank() }
+                                ?: if (attachment.uri.scheme == "data") attachment.uri.toString() else attachment.uri
+                            is SelectedMediaItem.ImageFromBitmap -> attachment.model
+                            else -> ""
+                        } }
+                        val currentImageModel by rememberUpdatedState(imageModel)
+                        coil3.compose.AsyncImage(
+                            model = imageModel,
+                            contentDescription = stringResource(R.string.attachment_image),
+                            contentScale = androidx.compose.ui.layout.ContentScale.Fit,
+                            onSuccess = { state ->
+                                val intrinsicSize = state.painter.intrinsicSize
+                                thumbnailSize = fitAttachmentThumbnail(
+                                    sourceWidth = intrinsicSize.width,
+                                    sourceHeight = intrinsicSize.height,
+                                )
+                                onImageLoaded()
+                            },
+                            modifier = Modifier
+                                .width(thumbnailSize.widthDp.dp)
+                                .height(thumbnailSize.heightDp.dp)
+                                .clip(imageShape)
+                                .background(MaterialTheme.colorScheme.surfaceVariant)
+                                .border(1.dp, imageBorderColor, imageShape)
+                                .onGloballyPositioned { imageGlobalPosition = it.localToRoot(Offset.Zero) }
+                                .pointerInput(message.id, attachment.id) {
+                                    detectTapGestures(
+                                        onTap = {
+                                            val url = currentImageModel.toString()
+                                            if (url.isNotBlank()) {
+                                                currentOnImageClick?.invoke(url) ?: run { previewUrlInternal = url }
+                                            }
+                                        },
+                                        onLongPress = { localOffset ->
+                                            haptic.performHapticFeedback(androidx.compose.ui.hapticfeedback.HapticFeedbackType.LongPress)
+                                            currentOnLongPress(currentMessage, imageGlobalPosition + localOffset)
+                                        }
+                                    )
+                                }
+                        )
+                    }
+                }
+                if (imageAttachments.size > 3) {
+                    androidx.compose.foundation.layout.Box(
+                        modifier = Modifier
+                            .align(Alignment.TopEnd)
+                            .padding(4.dp)
+                            .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.85f), RoundedCornerShape(8.dp))
+                            .padding(horizontal = 6.dp, vertical = 2.dp)
+                    ) {
+                        Text(
+                            text = pluralStringResource(
+                                R.plurals.attachment_image_count,
+                                imageAttachments.size,
+                                imageAttachments.size,
+                            ),
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+                if (canScrollBackward) {
+                    Box(
+                        modifier = Modifier
+                            .align(Alignment.CenterStart)
+                            .width(16.dp)
+                            .height(imageStripHeight)
+                            .background(
+                                Brush.horizontalGradient(
+                                    colors = listOf(fadeColor, Color.Transparent)
+                                )
+                            )
+                    )
+                }
+                if (canScrollForward) {
+                    Box(
+                        modifier = Modifier
+                            .align(Alignment.CenterEnd)
+                            .width(16.dp)
+                            .height(imageStripHeight)
+                            .background(
+                                Brush.horizontalGradient(
+                                    colors = listOf(Color.Transparent, fadeColor)
+                                )
+                            )
+                    )
+                }
+            }
+        }
+
+        nonImageAttachments.forEach { attachment ->
+            when (attachment) {
+                is SelectedMediaItem.GenericFile -> {
+                    var itemGlobalPosition by remember(attachment.id) { mutableStateOf(Offset.Zero) }
+                    Row(
+                        modifier = Modifier
+                            .widthIn(max = attachmentsAppliedMax)
+                            .padding(vertical = 4.dp)
+                            .background(bubbleColor, RoundedCornerShape(12.dp))
+                            .clip(RoundedCornerShape(12.dp))
+                            .onGloballyPositioned { itemGlobalPosition = it.localToRoot(Offset.Zero) }
+                            .pointerInput(message.id, attachment.uri) {
+                                detectTapGestures(
+                                    onTap = {
+                                        val intent = Intent(Intent.ACTION_VIEW).apply {
+                                            setDataAndType(attachment.uri, attachment.mimeType)
+                                            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                        }
+                                        context.startActivity(intent)
+                                    },
+                                    onLongPress = { localOffset ->
+                                        haptic.performHapticFeedback(androidx.compose.ui.hapticfeedback.HapticFeedbackType.LongPress)
+                                        currentOnLongPress(currentMessage, itemGlobalPosition + localOffset)
+                                    }
+                                )
+                            }
+                            .padding(horizontal = 12.dp, vertical = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(
+                            imageVector = getIconForMimeType(attachment.mimeType),
+                            contentDescription = stringResource(R.string.attachment_generic),
+                            modifier = Modifier.size(24.dp),
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            text = attachment.displayName.ifBlank {
+                                attachment.uri.pathSegments.lastOrNull().orEmpty().ifBlank { fallbackAttachmentName }
+                            },
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+                is SelectedMediaItem.Audio -> {
+                    var itemGlobalPosition by remember(attachment.id) { mutableStateOf(Offset.Zero) }
+                    Row(
+                        modifier = Modifier
+                            .widthIn(max = attachmentsAppliedMax)
+                            .padding(vertical = 4.dp)
+                            .background(bubbleColor, RoundedCornerShape(12.dp))
+                            .clip(RoundedCornerShape(12.dp))
+                            .onGloballyPositioned { itemGlobalPosition = it.localToRoot(Offset.Zero) }
+                            .pointerInput(message.id, attachment.id) {
+                                detectTapGestures(
+                                    onLongPress = { localOffset ->
+                                        haptic.performHapticFeedback(androidx.compose.ui.hapticfeedback.HapticFeedbackType.LongPress)
+                                        currentOnLongPress(currentMessage, itemGlobalPosition + localOffset)
+                                    }
+                                )
+                            }
+                            .padding(horizontal = 12.dp, vertical = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(
+                            imageVector = Icons.Outlined.Audiotrack,
+                            contentDescription = stringResource(R.string.attachment_audio_description),
+                            modifier = Modifier.size(24.dp),
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            text = stringResource(R.string.attachment_audio_description),
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+                else -> {}
+            }
+        }
+    }
+
+    if (previewUrlInternal != null) {
+        com.android.everytalk.ui.components.ImagePreviewDialog(
+            url = previewUrlInternal!!,
+            onDismiss = { previewUrlInternal = null }
+        )
+    }
+}
+
+
+
+
+
+
+@Composable
+private fun ThreeDotsLoadingAnimation(
+    modifier: Modifier = Modifier,
+    dotColor: Color = MaterialTheme.colorScheme.primary
+) {
+    Row(
+        modifier = modifier.padding(vertical = 8.dp),
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        (0..2).forEach { index ->
+            val infiniteTransition =
+                rememberInfiniteTransition(label = "dot_loading_transition_$index")
+            val animatedAlpha by infiniteTransition.animateFloat(
+                initialValue = 0.3f, targetValue = 1f,
+                animationSpec = infiniteRepeatable(
+                    animation = keyframes {
+                        durationMillis =
+                            1200; 0.3f at 0 using LinearEasing; 1.0f at 200 using LinearEasing
+                        0.3f at 400 using LinearEasing; 0.3f at 1200 using LinearEasing
+                    },
+                    repeatMode = RepeatMode.Restart, initialStartOffset = StartOffset(index * 150)
+                ), label = "dot_alpha_$index"
+            )
+            Box(
+                modifier = Modifier
+                    .size(10.dp)
+                    .background(dotColor.copy(alpha = animatedAlpha), RoundedCornerShape(50))
+            )
+        }
+    }
+}
+
+@Composable
+private fun getIconForMimeType(mimeType: String?): androidx.compose.ui.graphics.vector.ImageVector {
+    return when (mimeType) {
+        "application/pdf" -> Icons.Outlined.PictureAsPdf
+        "application/msword", "application/vnd.openxmlformats-officedocument.wordprocessingml.document" -> Icons.Outlined.Description
+        "application/vnd.ms-excel", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" -> Icons.Outlined.TableChart
+        "application/vnd.ms-powerpoint", "application/vnd.openxmlformats-officedocument.presentationml.presentation" -> Icons.Outlined.Slideshow
+        "application/zip", "application/x-rar-compressed" -> Icons.Outlined.Archive
+        else -> when {
+            mimeType?.startsWith("video/") == true -> Icons.Outlined.Videocam
+            mimeType?.startsWith("audio/") == true -> Icons.Outlined.Audiotrack
+            mimeType?.startsWith("image/") == true -> Icons.Outlined.Image
+            else -> Icons.Outlined.AttachFile
+        }
+    }
+}
+
+@Composable
+fun MessageContextMenu(
+    isVisible: Boolean,
+    message: Message,
+    onDismiss: () -> Unit,
+    onCopy: (Message) -> Unit,
+    onEdit: (Message) -> Unit,
+    onRegenerate: (Message) -> Unit,
+    pressOffset: Offset = Offset.Zero
+) {
+    key(message.id) {
+        val density = LocalDensity.current
+        val windowSize = LocalWindowInfo.current.containerSize
+        val isDark = isSystemInDarkTheme()
+
+        val menuWidth = 160.dp
+        val menuWidthPx = with(density) { menuWidth.toPx() }
+        val screenWidthPx = windowSize.width.toFloat()
+        val screenHeightPx = windowSize.height.toFloat()
+        val estimatedMenuHeightPx = with(density) { (56.dp * 3 + 16.dp).toPx() }
+
+        val rawX = pressOffset.x - menuWidthPx
+        val rawY = pressOffset.y
+
+        val finalX = rawX.coerceIn(0f, (screenWidthPx - menuWidthPx).coerceAtLeast(0f))
+        val finalY = rawY.coerceIn(0f, (screenHeightPx - estimatedMenuHeightPx).coerceAtLeast(0f))
+
+        val iconBg = if (isDark) Color(0xFF3B3B3B) else Color(0xFFE8E8E8)
+        val textColor = if (isDark) Color.White else Color(0xFF0D0D0D)
+        val iconTint = if (isDark) Color.White else Color(0xFF0D0D0D)
+
+        AppFloatingCardPopup(
+            visible = isVisible,
+            alignment = Alignment.TopStart,
+            offset = IntOffset(finalX.toInt(), finalY.toInt()),
+            onDismissRequest = onDismiss,
+            properties = PopupProperties(
+                focusable = true,
+                dismissOnBackPress = true,
+                dismissOnClickOutside = true,
+                clippingEnabled = false
+            ),
+            modifier = Modifier.width(menuWidth),
+        ) {
+            Column(modifier = Modifier.padding(vertical = 8.dp)) {
+                ContextMenuRow(
+                    icon = Icons.Filled.ContentCopy,
+                    label = stringResource(R.string.action_copy),
+                    iconBg = iconBg,
+                    iconTint = iconTint,
+                    textColor = textColor,
+                    onClick = { onCopy(message) }
+                )
+                ContextMenuRow(
+                    icon = Icons.Filled.Edit,
+                    label = stringResource(R.string.chat_action_edit),
+                    iconBg = iconBg,
+                    iconTint = iconTint,
+                    textColor = textColor,
+                    onClick = { onEdit(message) }
+                )
+                ContextMenuRow(
+                    icon = Icons.Filled.Refresh,
+                    label = stringResource(R.string.chat_action_regenerate),
+                    iconBg = iconBg,
+                    iconTint = iconTint,
+                    textColor = textColor,
+                    onClick = { onRegenerate(message) }
+                )
+            }
+        }
+    }
+}
+
+@Composable
+fun ImageContextMenu(
+   isVisible: Boolean,
+   message: Message,
+   onDismiss: () -> Unit,
+   onView: (Message) -> Unit,
+   onDownload: (Message) -> Unit,
+   onEdit: ((Message) -> Unit)? = null,
+   pressOffset: Offset = Offset.Zero
+) {
+   key(message.id) {
+       val density = LocalDensity.current
+       val windowSize = LocalWindowInfo.current.containerSize
+       val isDark = isSystemInDarkTheme()
+
+       val menuWidth = 160.dp
+       val menuWidthPx = with(density) { menuWidth.toPx() }
+       val screenWidthPx = windowSize.width.toFloat()
+       val screenHeightPx = windowSize.height.toFloat()
+       val estimatedMenuHeightPx = with(density) { (56.dp * imageContextMenuItemCount(onEdit != null) + 16.dp).toPx() }
+
+       val fingerVerticalOffsetPx = with(density) { 20.dp.toPx() }
+       val rawX = pressOffset.x
+       val rawY = pressOffset.y + fingerVerticalOffsetPx
+
+       val finalX = rawX.coerceIn(0f, (screenWidthPx - menuWidthPx).coerceAtLeast(0f))
+       val finalY = rawY.coerceIn(0f, (screenHeightPx - estimatedMenuHeightPx).coerceAtLeast(0f))
+
+       val iconBg = if (isDark) Color(0xFF3B3B3B) else Color(0xFFE8E8E8)
+       val textColor = if (isDark) Color.White else Color(0xFF0D0D0D)
+       val iconTint = if (isDark) Color.White else Color(0xFF0D0D0D)
+
+       AppFloatingCardPopup(
+           visible = isVisible,
+           alignment = Alignment.TopStart,
+           offset = IntOffset(finalX.toInt(), finalY.toInt()),
+           onDismissRequest = onDismiss,
+           properties = PopupProperties(
+               focusable = true,
+               dismissOnBackPress = true,
+               dismissOnClickOutside = true,
+               clippingEnabled = false
+           ),
+           modifier = Modifier.width(menuWidth),
+       ) {
+           Column(modifier = Modifier.padding(vertical = 8.dp)) {
+               ContextMenuRow(
+                   icon = Icons.Outlined.Image,
+                   label = stringResource(R.string.image_view),
+                   iconBg = iconBg,
+                   iconTint = iconTint,
+                   textColor = textColor,
+                   onClick = { onView(message) }
+               )
+               if (onEdit != null) {
+                   ContextMenuRow(
+                       icon = Icons.Filled.Edit,
+                       label = stringResource(imageContextMenuEditLabelRes()),
+                       iconBg = iconBg,
+                       iconTint = iconTint,
+                       textColor = textColor,
+                       onClick = { onEdit(message) }
+                   )
+               }
+               ContextMenuRow(
+                   icon = Icons.Outlined.Download,
+                   label = stringResource(R.string.image_download),
+                   iconBg = iconBg,
+                   iconTint = iconTint,
+                   textColor = textColor,
+                   onClick = { onDownload(message) }
+               )
+           }
+       }
+   }
+}
+
+internal fun imageContextMenuItemCount(showEditAction: Boolean): Int =
+    if (showEditAction) 3 else 2
+
+internal fun imageContextMenuEditLabelRes(): Int = R.string.image_edit
+
+@Composable
+private fun ContextMenuRow(
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    label: String,
+    iconBg: Color,
+    iconTint: Color,
+    textColor: Color,
+    onClick: () -> Unit
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onClick)
+            .padding(horizontal = 16.dp, vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Box(
+            modifier = Modifier
+                .size(36.dp)
+                .background(iconBg, CircleShape),
+            contentAlignment = Alignment.Center
+        ) {
+            Icon(
+                imageVector = icon,
+                contentDescription = null,
+                tint = iconTint,
+                modifier = Modifier.size(CONTEXT_MENU_ITEM_ICON_SIZE)
+            )
+        }
+        Spacer(modifier = Modifier.width(12.dp))
+        Text(
+            text = label,
+            fontSize = 16.sp,
+            color = textColor
+        )
+    }
+}

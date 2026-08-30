@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <script src="../echarts/echarts.min.js"></script>
+    <style>
+        body { margin: 0; padding: 0; height: 100vh; width: 100vw; overflow: hidden; background-color: #ffffff; }
+        @media (prefers-color-scheme: dark) {
+            body { background-color: #1e1e1e; }
+        }
+        #container { width: 100%; height: 100%; }
+    </style>
+</head>
+<body>
+    <div id="container"></div>
+    <script>
+        var chart = echarts.init(document.getElementById('container'), window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : null);
+        var completionReported = false;
+        var renderRequested = false;
+        var originalSetOption = chart.setOption;
+        chart.setOption = function() {
+            renderRequested = true;
+            return originalSetOption.apply(chart, arguments);
+        };
+        chart.on('finished', function() {
+            if (completionReported) return;
+            completionReported = true;
+            window.__everytalkPreviewReady();
+        });
+
+        var rawCode = `<!-- CONTENT_PLACEHOLDER -->`;
+        var option;
+        try {
+            try {
+                option = eval('(' + rawCode + ')');
+            } catch (parseError) {
+                try {
+                    eval(rawCode);
+                } catch (executionError) {
+                    throw new Error('Failed to parse ECharts option: ' + executionError.message);
+                }
+            }
+
+            if (option && typeof option === 'object') {
+                chart.setOption(option);
+            } else if (typeof option !== 'undefined') {
+                throw new Error('ECharts option must be an object');
+            }
+
+            if (!renderRequested) {
+                throw new Error('ECharts code did not request a render');
+            }
+        } catch (error) {
+            if (!completionReported) {
+                completionReported = true;
+                window.__everytalkPreviewError(error);
+            }
+        }
+
+        window.onresize = function() {
+            chart.resize();
+        };
+    </script>
+</body>
+</html>

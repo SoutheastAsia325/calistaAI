@@ -1,0 +1,267 @@
+package com.android.everytalk.ui.screens.settings
+
+import android.app.Application
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.ui.test.assertIsDisplayed
+import androidx.compose.ui.test.junit4.v2.createComposeRule
+import androidx.compose.ui.test.onNodeWithContentDescription
+import androidx.compose.ui.test.onNodeWithText
+import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.performScrollTo
+import androidx.compose.ui.test.performTextInput
+import androidx.compose.ui.test.performTextReplacement
+import androidx.test.core.app.ApplicationProvider
+import androidx.test.ext.junit.runners.AndroidJUnit4
+import com.android.everytalk.R
+import com.android.everytalk.data.DataClass.ApiConfig
+import com.android.everytalk.data.DataClass.CustomModelParameter
+import com.android.everytalk.data.DataClass.ModelCapabilityCandidate
+import com.android.everytalk.data.DataClass.ModelCapabilitySource
+import com.android.everytalk.data.DataClass.ModelParameterProtocol
+import com.android.everytalk.data.DataClass.ModelParameters
+import com.android.everytalk.data.DataClass.ReasoningMode
+import com.android.everytalk.data.DataClass.withModelCapabilityDefaults
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertTrue
+import org.junit.Rule
+import org.junit.Test
+import org.junit.runner.RunWith
+import org.robolectric.annotation.Config
+
+@RunWith(AndroidJUnit4::class)
+@Config(sdk = [34], application = Application::class, qualifiers = "zh-rCN")
+class ModelParametersDialogComposeTest {
+    @get:Rule
+    val composeRule = createComposeRule()
+
+    @Test
+    fun `当前参数在菜单右侧显示勾选图标`() {
+        val context = ApplicationProvider.getApplicationContext<Application>()
+        val config = ApiConfig(
+            address = "https://example.com",
+            key = "test-key",
+            model = "gpt-5.6",
+            provider = "OpenAI",
+            name = "测试模型",
+            channel = "OpenAI兼容",
+        )
+
+        composeRule.setContent {
+            MaterialTheme {
+                ModelParametersDialog(
+                    config = config,
+                    onDismissRequest = {},
+                    onConfirm = {},
+                )
+            }
+        }
+
+        composeRule.onNodeWithContentDescription("思考程度下拉框").performClick()
+
+        composeRule
+            .onNodeWithContentDescription(
+                context.getString(
+                    R.string.model_parameters_selected_option,
+                    context.getString(R.string.model_parameters_reasoning_medium),
+                ),
+                useUnmergedTree = true,
+            )
+            .assertIsDisplayed()
+    }
+
+    @Test
+    fun `OpenAI兼容菜单的自定义入口点击后可直接输入并保存`() {
+        val context = ApplicationProvider.getApplicationContext<Application>()
+        val config = openAICompatibleConfig()
+        var confirmedConfig: ApiConfig? = null
+
+        composeRule.setContent {
+            MaterialTheme {
+                ModelParametersDialog(
+                    config = config,
+                    onDismissRequest = {},
+                    onConfirm = { confirmedConfig = it },
+                )
+            }
+        }
+
+        composeRule.onNodeWithContentDescription("思考程度下拉框").performClick()
+        val customTop = composeRule.onNodeWithText("自定义").fetchSemanticsNode().boundsInRoot.top
+        val firstPresetTop = composeRule
+            .onNodeWithText(context.getString(R.string.model_parameters_reasoning_none))
+            .fetchSemanticsNode()
+            .boundsInRoot.top
+        assertTrue(customTop < firstPresetTop)
+        composeRule.onNodeWithText("自定义").assertIsDisplayed().performClick()
+        composeRule.onNodeWithContentDescription("思考程度下拉框").performTextInput("ultra")
+        composeRule.onNodeWithText("保存").performClick()
+
+        composeRule.runOnIdle {
+            assertNotNull(confirmedConfig)
+            assertEquals("ultra", confirmedConfig?.modelParameters?.reasoningEffort)
+            assertEquals(listOf("ultra"), confirmedConfig?.modelParameters?.customReasoningEfforts)
+        }
+    }
+
+    @Test
+    fun `已保存的自定义参数可从菜单删除`() {
+        val config = openAICompatibleConfig().copy(
+            modelParameters = ModelParameters(
+                reasoningEffort = "ultra",
+                customParameters = listOf(CustomModelParameter("reasoning_effort", "ultra")),
+                customReasoningEfforts = listOf("ultra"),
+            )
+        )
+        var confirmedConfig: ApiConfig? = null
+
+        composeRule.setContent {
+            MaterialTheme {
+                ModelParametersDialog(
+                    config = config,
+                    onDismissRequest = {},
+                    onConfirm = { confirmedConfig = it },
+                )
+            }
+        }
+
+        composeRule.onNodeWithContentDescription("思考程度下拉框").performClick()
+        composeRule
+            .onNodeWithContentDescription("删除自定义参数 ultra", useUnmergedTree = true)
+            .performScrollTo()
+            .performClick()
+        composeRule.onNodeWithContentDescription("思考程度下拉框").performClick()
+        composeRule.onNodeWithText("保存").performClick()
+
+        composeRule.runOnIdle {
+            assertEquals("medium", confirmedConfig?.modelParameters?.reasoningEffort)
+            assertEquals(emptyList<String>(), confirmedConfig?.modelParameters?.customReasoningEfforts)
+        }
+    }
+
+    @Test
+    fun `最大输出和上下文窗口可编辑并保存`() {
+        val config = openAICompatibleConfig()
+        var confirmedConfig: ApiConfig? = null
+        val context = ApplicationProvider.getApplicationContext<Application>()
+
+        composeRule.setContent {
+            MaterialTheme {
+                ModelParametersDialog(
+                    config = config,
+                    onDismissRequest = {},
+                    onConfirm = { confirmedConfig = it },
+                )
+            }
+        }
+
+        composeRule.onNodeWithContentDescription(
+            context.getString(R.string.model_parameters_max_output_content_description),
+        )
+            .performTextReplacement("8192")
+        composeRule.onNodeWithContentDescription(
+            context.getString(R.string.model_parameters_context_window_content_description),
+        )
+            .performTextReplacement("200000")
+        composeRule.onNodeWithText("保存").performClick()
+
+        composeRule.runOnIdle {
+            assertEquals(8192, confirmedConfig?.maxTokens)
+            assertEquals(200000, confirmedConfig?.modelParameters?.maxContextTokens)
+        }
+    }
+
+    @Test
+    fun `自动压缩开启后显示阈值并随模型保存`() {
+        val config = openAICompatibleConfig()
+        var confirmedConfig: ApiConfig? = null
+
+        composeRule.setContent {
+            MaterialTheme {
+                ModelParametersDialog(
+                    config = config,
+                    onDismissRequest = {},
+                    onConfirm = { confirmedConfig = it },
+                )
+            }
+        }
+
+        composeRule.onNodeWithContentDescription("自动压缩开关")
+            .performScrollTo()
+            .performClick()
+        composeRule.onNodeWithText("80%").performScrollTo().assertIsDisplayed()
+        composeRule.onNodeWithContentDescription("自动压缩触发阈值")
+            .performScrollTo()
+            .assertIsDisplayed()
+        composeRule.onNodeWithText("保存").performClick()
+
+        composeRule.runOnIdle {
+            assertEquals(true, confirmedConfig?.modelParameters?.autoContextCompressionEnabled)
+            assertEquals(80, confirmedConfig?.modelParameters?.autoContextCompressionThresholdPercent)
+        }
+    }
+
+    @Test
+    fun `右上角加载按钮自动更新思考能力和 token 限制`() {
+        val config = ApiConfig(
+            address = "https://api.example.com",
+            key = "secret",
+            model = "model-a",
+            provider = "Gemini",
+            name = "测试模型",
+            channel = "Gemini",
+        )
+        val loadedConfig = config.withModelCapabilityDefaults(
+            listOf(
+                ModelCapabilityCandidate(
+                    modelId = "model-a",
+                    protocol = ModelParameterProtocol.GEMINI,
+                    endpointIdentity = config.address,
+                    contextWindowTokens = 1_000_000,
+                    maxOutputTokens = 64_000,
+                    supportsReasoning = false,
+                    source = ModelCapabilitySource.LIVE_ENDPOINT,
+                )
+            )
+        )
+        var confirmedConfig: ApiConfig? = null
+
+        composeRule.setContent {
+            MaterialTheme {
+                ModelParametersDialog(
+                    config = config,
+                    onDismissRequest = {},
+                    onConfirm = { confirmedConfig = it },
+                    onAutoLoad = { Result.success(loadedConfig) },
+                )
+            }
+        }
+
+        val titleBounds = composeRule.onNodeWithText("模型参数").fetchSemanticsNode().boundsInRoot
+        val loadButton = composeRule.onNodeWithContentDescription("自动获取模型参数")
+        assertTrue(loadButton.fetchSemanticsNode().boundsInRoot.left > titleBounds.right)
+        loadButton.performClick()
+        composeRule.waitForIdle()
+        composeRule.onNodeWithText("保存").performClick()
+
+        composeRule.runOnIdle {
+            assertEquals(64_000, confirmedConfig?.maxTokens)
+            assertEquals(1_000_000, confirmedConfig?.modelParameters?.maxContextTokens)
+            assertEquals(ReasoningMode.DISABLED, confirmedConfig?.modelParameters?.reasoningMode)
+            assertEquals("none", confirmedConfig?.modelParameters?.reasoningEffort)
+            assertEquals(
+                ModelCapabilitySource.LIVE_ENDPOINT,
+                confirmedConfig?.modelParameters?.resolvedCapability?.contextWindowSource,
+            )
+        }
+    }
+
+    private fun openAICompatibleConfig() = ApiConfig(
+        address = "https://example.com",
+        key = "test-key",
+        model = "gpt-5.6",
+        provider = "OpenAI",
+        name = "测试模型",
+        channel = "OpenAI兼容",
+    )
+}

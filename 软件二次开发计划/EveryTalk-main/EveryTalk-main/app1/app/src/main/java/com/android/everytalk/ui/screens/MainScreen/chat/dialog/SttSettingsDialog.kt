@@ -1,0 +1,460 @@
+package com.android.everytalk.ui.screens.MainScreen.chat.dialog
+import com.android.everytalk.statecontroller.*
+
+import androidx.compose.foundation.border
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.isSystemInDarkTheme
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
+import androidx.core.content.edit
+import com.android.everytalk.R
+import com.android.everytalk.data.DataClass.VoiceBackendConfig
+import com.android.everytalk.statecontroller.AppViewModel
+import com.android.everytalk.ui.screens.MainScreen.chat.models.DynamicModelSelector
+import com.android.everytalk.ui.screens.MainScreen.chat.voice.logic.VoiceConfigManager
+import com.android.everytalk.ui.screens.settings.DialogTextFieldColors
+import com.android.everytalk.ui.screens.settings.DialogShape
+import com.android.everytalk.ui.screens.settings.SettingsFieldLabel
+import com.android.everytalk.ui.components.popup.AppFloatingCardElevation
+import com.android.everytalk.ui.components.popup.AppFloatingCardShape
+import com.android.everytalk.ui.components.popup.appFloatingCardBorderColor
+import com.android.everytalk.ui.components.popup.appFloatingCardContainerColor
+import kotlinx.coroutines.launch
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun SttSettingsDialog(
+    onDismiss: () -> Unit,
+    viewModel: AppViewModel? = null
+) {
+    if (viewModel == null) {
+        onDismiss()
+        return
+    }
+
+    val context = LocalContext.current
+    val coroutineScope = rememberCoroutineScope()
+    val currentConfig by viewModel.stateHolder._selectedVoiceConfig.collectAsState()
+    val allConfigs by viewModel.stateHolder._voiceBackendConfigs.collectAsState()
+
+    // 如果没有当前配置，创建一个默认的
+    val effectiveConfig = currentConfig ?: VoiceBackendConfig.createDefault()
+
+    // 状态管理
+    var selectedPlatform by remember(effectiveConfig) { mutableStateOf(effectiveConfig.sttPlatform) }
+    var apiKey by remember(effectiveConfig) { mutableStateOf(effectiveConfig.sttApiKey) }
+    var apiUrl by remember(effectiveConfig) { mutableStateOf(effectiveConfig.sttApiUrl) }
+    var model by remember(effectiveConfig) { mutableStateOf(effectiveConfig.sttModel) }
+    var expanded by remember { mutableStateOf(false) }
+    
+    // 实时流式模式开关（仅阿里云支持）- 从配置中读取
+    var useRealtimeStreaming by remember(effectiveConfig) { mutableStateOf(effectiveConfig.useRealtimeStreaming) }
+    
+    // 当平台切换时，从 Room 存储的 allConfigs 中查找对应平台的配置
+    fun loadFieldsForPlatform(platform: String) {
+        // 1. 从 allConfigs 中查找该平台的配置（已持久化到 Room）
+        val existingConfig = allConfigs.find { it.sttPlatform == platform }
+        
+        if (existingConfig != null) {
+            // 找到了该平台的配置，加载它
+            apiKey = existingConfig.sttApiKey
+            apiUrl = existingConfig.sttApiUrl
+            model = existingConfig.sttModel
+            // 同时加载该配置的实时流式设置
+            useRealtimeStreaming = existingConfig.useRealtimeStreaming
+        } else {
+            // 没有找到该平台的配置，使用平台默认值
+            apiKey = ""
+            apiUrl = when (platform) {
+                "SiliconFlow" -> "https://api.siliconflow.cn/v1/audio/transcriptions"
+                "Aliyun" -> "https://dashscope.aliyuncs.com"
+                "OpenAI" -> "" // OpenAI 需要用户自己填写
+                else -> ""
+            }
+            model = when (platform) {
+                "SiliconFlow" -> "FunAudioLLM/SenseVoiceSmall"
+                "Aliyun" -> "fun-asr-realtime"
+                "OpenAI" -> "whisper-1"
+                else -> ""
+            }
+            // 重置实时流式设置
+            useRealtimeStreaming = false
+        }
+    }
+    
+    // 保存当前平台的配置到缓存（在切换平台前调用，仅保存到 allConfigs 列表中供后续加载）
+    fun savePlatformConfigToCache(platform: String) {
+        // 只有当有实际内容时才保存
+        if (apiKey.isBlank() && apiUrl.isBlank() && model.isBlank()) {
+            return
+        }
+        
+        // 查找或创建该平台的配置
+        val existingConfig = allConfigs.find { it.sttPlatform == platform }
+        
+        val configToSave = if (existingConfig != null) {
+            // 更新现有配置
+            existingConfig.copy(
+                sttApiKey = apiKey.trim(),
+                sttApiUrl = apiUrl.trim(),
+                sttModel = model.trim(),
+                useRealtimeStreaming = if (platform == "Aliyun") useRealtimeStreaming else false,
+                updatedAt = System.currentTimeMillis()
+            )
+        } else {
+            // 创建新配置（为该平台创建独立记录）
+            VoiceBackendConfig(
+                id = java.util.UUID.randomUUID().toString(),
+                name = context.getString(R.string.voice_stt_config_name, platform),
+                provider = platform,
+                sttPlatform = platform,
+                sttApiKey = apiKey.trim(),
+                sttApiUrl = apiUrl.trim(),
+                sttModel = model.trim(),
+                useRealtimeStreaming = if (platform == "Aliyun") useRealtimeStreaming else false,
+                // 保留其他默认值
+                chatPlatform = "Google",
+                ttsPlatform = "Gemini",
+                voiceName = "Kore"
+            )
+        }
+        
+        // 更新配置列表（仅更新内存中的列表）
+        val newConfigs = if (existingConfig != null) {
+            allConfigs.map { if (it.id == configToSave.id) configToSave else it }
+        } else {
+            allConfigs + configToSave
+        }
+        
+        // 保存到 Room（用于平台切换时的配置缓存）
+        viewModel.stateHolder._voiceBackendConfigs.value = newConfigs
+        coroutineScope.launch {
+            viewModel.persistenceManager.saveVoiceBackendConfigs(newConfigs)
+        }
+    }
+    
+    val platforms = listOf("Google", "OpenAI", "SiliconFlow", "Aliyun")
+    
+    // 自定义模型管理 (存储在 SharedPreferences 中，仅作为 UI 辅助)
+    val uiPrefs = remember { context.getSharedPreferences("voice_ui_prefs", android.content.Context.MODE_PRIVATE) }
+    val customModelsKey = "custom_models_stt_${selectedPlatform}"
+    val savedCustomModelsStr = remember(selectedPlatform) { uiPrefs.getString(customModelsKey, "") ?: "" }
+    
+    var customModels by remember(selectedPlatform) {
+        mutableStateOf(
+            if (savedCustomModelsStr.isNotEmpty()) savedCustomModelsStr.split(",").filter { it.isNotEmpty() }
+            else emptyList()
+        )
+    }
+    // 确保当前选中的模型也在列表中（即使不在 SharedPreferences 中）
+    val allModels = remember(customModels, model) {
+        if (model.isNotBlank() && !customModels.contains(model)) {
+            listOf(model) + customModels
+        } else {
+            customModels
+        }
+    }
+    
+    val isDarkTheme = isSystemInDarkTheme()
+    val dialogBg = if (isDarkTheme) Color.Black else Color.White
+    val borderColor = if (isDarkTheme) Color(0xFF414141) else Color(0xFFF3F3F3)
+    val contentColor = if (isDarkTheme) Color.White else Color(0xFF0D0D0D)
+    val subtextColor = if (isDarkTheme) Color.White.copy(alpha = 0.6f) else Color(0xFF0D0D0D).copy(alpha = 0.6f)
+    
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(
+            dismissOnClickOutside = true,
+            dismissOnBackPress = true,
+            usePlatformDefaultWidth = false
+        )
+    ) {
+        Card(
+            shape = RoundedCornerShape(28.dp),
+            modifier = Modifier
+                .fillMaxWidth(0.9f)
+                .wrapContentHeight()
+                .border(1.dp, borderColor, RoundedCornerShape(28.dp)),
+            colors = CardDefaults.cardColors(
+                containerColor = dialogBg
+            )
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(24.dp),
+                verticalArrangement = Arrangement.spacedBy(16.dp)
+            ) {
+                Text(
+                    text = stringResource(R.string.voice_stt_settings_title),
+                    style = MaterialTheme.typography.headlineSmall.copy(
+                        fontWeight = FontWeight.Bold
+                    ),
+                    color = contentColor
+                )
+                
+                // 平台选择
+                Column(
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    SettingsFieldLabel(stringResource(R.string.voice_platform_label))
+                    ExposedDropdownMenuBox(
+                        expanded = expanded,
+                        onExpandedChange = { expanded = it }
+                    ) {
+                        OutlinedTextField(
+                            value = selectedPlatform,
+                            onValueChange = {},
+                            readOnly = true,
+                            trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expanded) },
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .menuAnchor(ExposedDropdownMenuAnchorType.PrimaryNotEditable, enabled = true),
+                            colors = DialogTextFieldColors,
+                            shape = DialogShape
+                        )
+                        ExposedDropdownMenu(
+                            expanded = expanded,
+                            onDismissRequest = { expanded = false },
+                            modifier = Modifier.border(
+                                1.dp,
+                                appFloatingCardBorderColor(),
+                                AppFloatingCardShape,
+                            ),
+                            shape = AppFloatingCardShape,
+                            containerColor = appFloatingCardContainerColor(),
+                            tonalElevation = 0.dp,
+                            shadowElevation = AppFloatingCardElevation,
+                        ) {
+                            platforms.forEach { platform ->
+                                DropdownMenuItem(
+                                    text = { Text(platform, color = contentColor) },
+                                    onClick = {
+                                        if (platform != selectedPlatform) {
+                                            // 先保存当前平台的配置到缓存
+                                            savePlatformConfigToCache(selectedPlatform)
+                                            // 然后加载新平台的配置
+                                            loadFieldsForPlatform(platform)
+                                            selectedPlatform = platform
+                                        }
+                                        expanded = false
+                                    }
+                                )
+                            }
+                        }
+                    }
+                }
+                
+                // API Key
+                Column(
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    SettingsFieldLabel(stringResource(R.string.voice_api_key_label))
+                    OutlinedTextField(
+                        value = apiKey,
+                        onValueChange = { apiKey = it },
+                        modifier = Modifier.fillMaxWidth(),
+                        placeholder = { Text(stringResource(R.string.voice_api_key_hint)) },
+                        colors = DialogTextFieldColors,
+                        shape = DialogShape,
+                        singleLine = true
+                    )
+                }
+
+                // API 地址
+                Column(
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    SettingsFieldLabel(stringResource(R.string.voice_api_url_label))
+                    OutlinedTextField(
+                        value = apiUrl,
+                        onValueChange = { apiUrl = it },
+                        modifier = Modifier.fillMaxWidth(),
+                        placeholder = { Text(stringResource(R.string.voice_api_url_openai_example)) },
+                        supportingText = {
+                            if (apiUrl.isNotEmpty() && !apiUrl.startsWith("http")) {
+                                Text(stringResource(R.string.voice_api_url_invalid), color = MaterialTheme.colorScheme.error)
+                            } else if (selectedPlatform == "OpenAI" && apiUrl.isBlank()) {
+                                Text(stringResource(R.string.voice_api_url_openai_required), color = MaterialTheme.colorScheme.error)
+                            } else if (selectedPlatform == "OpenAI") {
+                                Text(stringResource(R.string.voice_api_url_openai_custom), color = subtextColor)
+                            } else if (selectedPlatform == "SiliconFlow") {
+                                Text(stringResource(R.string.voice_siliconflow_stt_default_url), color = subtextColor)
+                            } else if (selectedPlatform == "Aliyun") {
+                                Text(stringResource(R.string.voice_aliyun_stt_url_note), color = subtextColor)
+                            } else {
+                                // 智能提示最终使用的完整URL
+                                val finalUrl = if (selectedPlatform == "OpenAI" && apiUrl.isNotBlank()) {
+                                    if (!apiUrl.endsWith("/transcriptions")) {
+                                        "${apiUrl.trimEnd('/')}/audio/transcriptions"
+                                    } else {
+                                        null
+                                    }
+                                } else {
+                                    null
+                                }
+                                
+                                if (finalUrl != null) {
+                                    Text(stringResource(R.string.voice_final_request_url, finalUrl), color = MaterialTheme.colorScheme.primary)
+                                } else {
+                                    Text(stringResource(R.string.voice_api_url_use_default), color = subtextColor)
+                                }
+                            }
+                        },
+                        colors = DialogTextFieldColors,
+                        shape = DialogShape,
+                        singleLine = true
+                    )
+                }
+
+                // 模型名称 (动态列表)
+                DynamicModelSelector(
+                    label = stringResource(R.string.voice_model_name_label),
+                    currentModel = model,
+                    onModelChange = { model = it },
+                    modelList = allModels,
+                    onAddModel = { newModel ->
+                        if (newModel.isNotBlank() && !customModels.contains(newModel)) {
+                            val newList = customModels + newModel.trim()
+                            customModels = newList
+                            uiPrefs.edit { putString(customModelsKey, newList.joinToString(",")) }
+                            model = newModel.trim()
+                        }
+                    },
+                    onRemoveModel = { modelToRemove ->
+                        val newList = customModels - modelToRemove
+                        customModels = newList
+                        uiPrefs.edit { putString(customModelsKey, newList.joinToString(",")) }
+                        if (model == modelToRemove) {
+                            model = ""
+                        }
+                    }
+                )
+                
+                // 实时流式模式开关（仅阿里云显示）- 直连实时 STT
+                if (selectedPlatform == "Aliyun") {
+                    Card(
+                        colors = CardDefaults.cardColors(
+                            containerColor = if (isDarkTheme) Color(0xFF1A1A1A) else Color(0xFFF5F5F5)
+                        ),
+                        border = BorderStroke(1.dp, borderColor),
+                        shape = RoundedCornerShape(16.dp),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(16.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = stringResource(R.string.voice_realtime_recognition_title),
+                                    style = MaterialTheme.typography.titleMedium.copy(
+                                        fontWeight = FontWeight.SemiBold
+                                    ),
+                                    color = contentColor
+                                )
+                                Spacer(modifier = Modifier.height(4.dp))
+                                Text(
+                                    text = stringResource(R.string.voice_realtime_recognition_description),
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = subtextColor
+                                )
+                            }
+                            Switch(
+                                checked = useRealtimeStreaming,
+                                onCheckedChange = { useRealtimeStreaming = it },
+                                colors = SwitchDefaults.colors(
+                                    checkedThumbColor = if (isDarkTheme) Color.Black else Color.White,
+                                    checkedTrackColor = contentColor,
+                                    checkedBorderColor = Color.Transparent,
+                                    uncheckedThumbColor = if (isDarkTheme) Color.White else MaterialTheme.colorScheme.outline,
+                                    uncheckedTrackColor = if (isDarkTheme) Color(0xFF333333) else Color(0xFFE0E0E0),
+                                    uncheckedBorderColor = Color.Transparent
+                                )
+                            )
+                        }
+                    }
+                }
+                
+                // 底部按钮
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    OutlinedButton(
+                        onClick = onDismiss,
+                        modifier = Modifier.weight(1f).height(48.dp),
+                        shape = RoundedCornerShape(24.dp),
+                        colors = ButtonDefaults.outlinedButtonColors(
+                            containerColor = Color.Transparent,
+                            contentColor = contentColor
+                        ),
+                        border = androidx.compose.foundation.BorderStroke(1.dp, borderColor)
+                    ) {
+                        Text(stringResource(R.string.action_cancel), style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.SemiBold))
+                    }
+                    
+                    Button(
+                        onClick = {
+                            coroutineScope.launch {
+                                // 先保存当前平台的配置到缓存
+                                savePlatformConfigToCache(selectedPlatform)
+                                
+                                // 更新当前选中配置的 STT 部分（保留 LLM 和 TTS 的设置）
+                                val configToUpdate = currentConfig ?: effectiveConfig
+                                
+                                val newConfig = configToUpdate.copy(
+                                    sttPlatform = selectedPlatform,
+                                    sttApiKey = apiKey.trim(),
+                                    sttApiUrl = apiUrl.trim(),
+                                    sttModel = model.trim(),
+                                    useRealtimeStreaming = if (selectedPlatform == "Aliyun") useRealtimeStreaming else false,
+                                    updatedAt = System.currentTimeMillis()
+                                )
+                                
+                                // 更新配置列表
+                                val latestConfigs = viewModel.stateHolder._voiceBackendConfigs.value
+                                val configExists = latestConfigs.any { it.id == newConfig.id }
+                                val newConfigs = if (configExists) {
+                                    latestConfigs.map { if (it.id == newConfig.id) newConfig else it }
+                                } else {
+                                    latestConfigs + newConfig
+                                }
+                                
+                                // 保存到 Room
+                                viewModel.stateHolder._voiceBackendConfigs.value = newConfigs
+                                viewModel.stateHolder._selectedVoiceConfig.value = newConfig
+                                viewModel.persistenceManager.saveVoiceBackendConfigs(newConfigs)
+                                viewModel.persistenceManager.saveSelectedVoiceConfigId(newConfig.id)
+                                
+                                onDismiss()
+                            }
+                        },
+                        modifier = Modifier.weight(1f).height(48.dp),
+                        shape = RoundedCornerShape(24.dp),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = contentColor,
+                            contentColor = dialogBg
+                        )
+                    ) {
+                        Text(stringResource(R.string.action_confirm), style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.SemiBold))
+                    }
+                }
+            }
+        }
+    }
+}

@@ -1,0 +1,301 @@
+package com.android.everytalk.statecontroller.controller.conversation
+
+import android.util.Log
+import com.android.everytalk.statecontroller.ApiHandler
+import com.android.everytalk.statecontroller.ViewModelStateHolder
+import com.android.everytalk.ui.screens.viewmodel.HistoryManager
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
+import com.android.everytalk.data.DataClass.Message
+import com.android.everytalk.data.DataClass.Sender
+import com.android.everytalk.data.network.extractThinkTagContent
+import com.android.everytalk.util.ConversationNameHelper
+
+internal fun prepareLoadedHistoryMessages(messages: List<Message>, sessionId: String): List<Message> =
+    repairHistoryMessageParts(
+        processLoadedMessages(ConversationNameHelper.withoutStoredConversationTitle(messages)),
+        sessionId,
+    )
+
+private fun processLoadedMessages(messages: List<Message>): List<Message> {
+    return messages.map { message ->
+        if (message.sender == Sender.AI && message.text.isNotBlank()) {
+            val extraction = extractThinkTagContent(message.text)
+            if (extraction.changed) {
+                val mergedReasoning = listOfNotNull(message.reasoning, extraction.reasoning)
+                    .filter { it.isNotBlank() }
+                    .joinToString("\n\n")
+                    .ifBlank { null }
+                message.copy(
+                    text = extraction.content,
+                    reasoning = mergedReasoning,
+                    contentStarted = true,
+                    parts = emptyList(),
+                )
+            } else {
+                message.copy(contentStarted = true)
+            }
+        } else {
+            message
+        }
+    }
+}
+
+private fun repairHistoryMessageParts(messages: List<Message>, sessionId: String): List<Message> {
+    return messages.map { message ->
+        if (message.sender == Sender.AI &&
+            message.text.isNotBlank() &&
+            (message.parts.isEmpty() || !hasValidParts(message.parts))) {
+            Log.d("HistoryController", "Repairing message parts for messageId=${message.id}")
+            try {
+                val tempProcessor = com.android.everytalk.util.messageprocessor.MessageProcessor().apply {
+                    initialize(sessionId, message.id)
+                }
+                val repaired = tempProcessor.finalizeMessageProcessing(message)
+                Log.d("HistoryController", "Repaired parts: ${repaired.parts.size}")
+                repaired
+            } catch (e: Exception) {
+                Log.w("HistoryController", "Failed to repair parts for ${message.id}: ${e.message}")
+                message
+            }
+        } else {
+            message
+        }
+    }
+}
+
+private fun hasValidParts(parts: List<com.android.everytalk.ui.components.MarkdownPart>): Boolean {
+    return parts.any { part ->
+        when (part) {
+            is com.android.everytalk.ui.components.MarkdownPart.Text -> part.content.isNotBlank()
+            is com.android.everytalk.ui.components.MarkdownPart.CodeBlock -> part.content.isNotBlank()
+            else -> true
+        }
+    }
+}
+
+/**
+ * HistoryController
+ * 负责：
+ * - 加载文本/图像历史
+ * - 删除/清空会话（文本/图像）
+ * - 完整名称生成
+ * - 重命名会话
+ * - 辅助：修复历史消息 parts 与完整性处理
+ */
+class HistoryController(
+    private val stateHolder: ViewModelStateHolder,
+    private val historyManager: HistoryManager,
+    private val apiHandler: ApiHandler,
+    private val scope: CoroutineScope,
+    private val showSnackbar: (String) -> Unit,
+    private val shouldAutoScroll: () -> Boolean,
+    private val triggerScrollToBottom: () -> Unit,
+    private val simpleModeSwitcher: SimpleModeSwitcher,
+    private val defaultNameFactory: (Int, Boolean) -> String =
+        com.android.everytalk.util.ConversationNameHelper::getDefaultConversationName,
+) {
+    interface SimpleModeSwitcher {
+        fun switchToTextMode(forceNew: Boolean = false, skipSavingTextChat: Boolean = false)
+        fun switchToImageMode(forceNew: Boolean = false, skipSavingImageChat: Boolean = false)
+        suspend fun loadTextHistory(index: Int)
+        suspend fun loadImageHistory(index: Int)
+        fun isInImageMode(): Boolean
+    }
+
+    private val messagesMutex = Mutex()
+
+    fun getConversationFullText(index: Int, isImageGeneration: Boolean): String {
+        val conversationList = if (isImageGeneration) {
+            stateHolder._imageGenerationHistoricalConversations.value
+        } else {
+            stateHolder._historicalConversations.value
+        }
+        val conversation = conversationList.getOrNull(index) ?: return getDefaultConversationName(index, isImageGeneration)
+        ConversationNameHelper.getStoredConversationTitle(conversation)?.let { return it }
+        val firstUser = conversation.firstOrNull { it.sender == Sender.User && it.text.isNotBlank() }
+        val raw = firstUser?.text?.trim() ?: return getDefaultConversationName(index, isImageGeneration)
+        return com.android.everytalk.util.ConversationNameHelper.cleanAndTruncateText(raw, 100)
+    }
+
+    fun renameConversation(index: Int, newName: String, isImageGeneration: Boolean) {
+        val trimmed = newName.trim()
+        if (trimmed.isBlank()) {
+            showSnackbar("新名称不能为空")
+            return
+        }
+        val historicalState = if (isImageGeneration) {
+            stateHolder._imageGenerationHistoricalConversations
+        } else {
+            stateHolder._historicalConversations
+        }
+        val currentHistorical = historicalState.value
+        if (index !in currentHistorical.indices) {
+            showSnackbar("无法重命名：对话索引错误")
+            return
+        }
+
+        val original = currentHistorical[index].toMutableList()
+        val stableId = ConversationNameHelper.resolveStableId(original)
+        if (stableId == null) {
+            showSnackbar("无法重命名：会话标识缺失")
+            return
+        }
+        val existingTitleIndex = original.indexOfFirst {
+            it.sender == Sender.System && it.isPlaceholderName
+        }
+        if (existingTitleIndex >= 0) {
+            original[existingTitleIndex] = original[existingTitleIndex].copy(
+                text = trimmed,
+                timestamp = System.currentTimeMillis(),
+            )
+        } else {
+            original.add(
+                0,
+                Message(
+                    id = "title_${java.util.UUID.randomUUID()}",
+                    text = trimmed,
+                    sender = Sender.System,
+                    timestamp = System.currentTimeMillis() - 1,
+                    contentStarted = true,
+                    isPlaceholderName = true,
+                ),
+            )
+        }
+        historicalState.value = currentHistorical.toMutableList().apply {
+            this[index] = original.toList()
+        }
+
+        // 当前聊天只保留可见消息，名称继续只存在于历史元数据中。
+        val loadedIndex = if (isImageGeneration) {
+            stateHolder._loadedImageGenerationHistoryIndex.value
+        } else {
+            stateHolder._loadedHistoryIndex.value
+        }
+        if (loadedIndex == index) {
+            val visibleMessages = if (isImageGeneration) {
+                stateHolder.imageGenerationMessages
+            } else {
+                stateHolder.messages
+            }
+            visibleMessages.removeAll { it.sender == Sender.System && it.isPlaceholderName }
+        }
+
+        scope.launch {
+            historyManager.renameHistorySession(stableId, trimmed)
+            withContext(Dispatchers.Main) { showSnackbar("对话已重命名") }
+        }
+    }
+
+    suspend fun loadTextHistory(index: Int) {
+        stateHolder._isTextApiCalling.value = false
+        stateHolder._currentTextStreamingAiMessageId.value = null
+        stateHolder._lastSentUserMessageId.value = null
+        try {
+            simpleModeSwitcher.loadTextHistory(index)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.e("HistoryController", "Error loading text history", e)
+            showSnackbar("加载文本历史对话失败: ${e.message}")
+        }
+    }
+
+    fun loadImageHistory(index: Int) {
+        scope.launch {
+            stateHolder._isLoadingImageHistory.value = true
+            stateHolder._lastSentImageUserMessageId.value = null
+            try {
+                simpleModeSwitcher.loadImageHistory(index)
+                val loadedMessages = stateHolder.imageGenerationMessages.toList()
+                val sessionId = stateHolder._currentImageGenerationConversationId.value
+                val repaired = withContext(Dispatchers.Default) {
+                    prepareLoadedHistoryMessages(loadedMessages, sessionId)
+                }
+                if (loadedMessages != repaired) {
+                    stateHolder.imageGenerationMessages.clear()
+                    stateHolder.imageGenerationMessages.addAll(repaired)
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.e("HistoryController", "IMAGE ERROR", e)
+                showSnackbar("加载图像历史失败: ${e.message}")
+            } finally {
+                stateHolder._isLoadingImageHistory.value = false
+            }
+        }
+    }
+
+    fun deleteConversation(indexToDelete: Int, isImageGeneration: Boolean = false) {
+        val currentLoadedIndex = if (isImageGeneration) stateHolder._loadedImageGenerationHistoryIndex.value
+        else stateHolder._loadedHistoryIndex.value
+        val conversations = if (isImageGeneration) stateHolder._imageGenerationHistoricalConversations.value
+        else stateHolder._historicalConversations.value
+        if (indexToDelete < 0 || indexToDelete >= conversations.size) {
+            showSnackbar("无法删除：无效的索引")
+            return
+        }
+        scope.launch {
+            val wasCurrentDeleted = (currentLoadedIndex == indexToDelete)
+            val idsInDeleted = conversations.getOrNull(indexToDelete)?.map { it.id } ?: emptyList()
+
+            withContext(Dispatchers.IO) { historyManager.deleteConversation(indexToDelete, isImageGeneration) }
+
+            if (wasCurrentDeleted) {
+                if (isImageGeneration) simpleModeSwitcher.switchToImageMode(forceNew = true, skipSavingImageChat = true)
+                else simpleModeSwitcher.switchToTextMode(forceNew = true, skipSavingTextChat = true)
+                apiHandler.cancelCurrentApiJob("当前聊天(#$indexToDelete)被删除，开始新聊天")
+            }
+
+            if (idsInDeleted.isNotEmpty()) {
+                if (isImageGeneration) {
+                    stateHolder.imageReasoningCompleteMap.keys.removeAll(idsInDeleted)
+                    stateHolder.imageExpandedReasoningStates.keys.removeAll(idsInDeleted)
+                    stateHolder.imageMessageAnimationStates.keys.removeAll(idsInDeleted)
+                } else {
+                    stateHolder.textReasoningCompleteMap.keys.removeAll(idsInDeleted)
+                    stateHolder.textExpandedReasoningStates.keys.removeAll(idsInDeleted)
+                    stateHolder.textMessageAnimationStates.keys.removeAll(idsInDeleted)
+                }
+            }
+
+            // 强制触发 StateFlow 更新
+            if (isImageGeneration) {
+                stateHolder._imageGenerationHistoricalConversations.value =
+                    stateHolder._imageGenerationHistoricalConversations.value.toList()
+            } else {
+                stateHolder._historicalConversations.value = stateHolder._historicalConversations.value.toList()
+            }
+        }
+    }
+
+    fun clearAllConversations(isImageGeneration: Boolean = false) {
+        scope.launch {
+            if (!isImageGeneration) {
+                withContext(Dispatchers.IO) { historyManager.clearAllHistory() }
+                messagesMutex.withLock {
+                    stateHolder.clearForNewTextChat()
+                    if (shouldAutoScroll()) triggerScrollToBottom()
+                }
+                showSnackbar("记录已清空")
+            } else {
+                withContext(Dispatchers.IO) { historyManager.clearAllHistory(isImageGeneration = true) }
+                messagesMutex.withLock {
+                    stateHolder.clearForNewImageChat()
+                    if (shouldAutoScroll()) triggerScrollToBottom()
+                }
+                showSnackbar("图像记录已清空")
+            }
+        }
+    }
+
+    private fun getDefaultConversationName(index: Int, isImageGeneration: Boolean): String {
+        return defaultNameFactory(index, isImageGeneration)
+    }
+}

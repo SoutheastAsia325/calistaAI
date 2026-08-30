@@ -1,0 +1,964 @@
+package com.android.everytalk.statecontroller
+
+import android.app.Application
+import android.content.Intent
+import android.net.Uri
+import android.os.Bundle
+import androidx.profileinstaller.ProfileInstaller
+import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import androidx.activity.compose.BackHandler
+import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AppCompatActivity
+import androidx.core.content.IntentCompat
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsControllerCompat
+import androidx.compose.animation.ExitTransition
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.isSystemInDarkTheme
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.navigationBars
+import androidx.compose.foundation.layout.windowInsetsPadding
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalWindowInfo
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.zIndex
+import com.android.everytalk.util.locale.localizeUiMessage
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.viewmodel.compose.viewModel
+import androidx.navigation.compose.NavHost
+import androidx.navigation.compose.composable
+import androidx.navigation.compose.currentBackStackEntryAsState
+import androidx.navigation.compose.rememberNavController
+// Removed SharedPreferencesDataSource import
+import com.android.everytalk.navigation.Screen
+import com.android.everytalk.ui.screens.MainScreen.AppDrawerContent
+import com.android.everytalk.ui.screens.MainScreen.ChatScreen
+import com.android.everytalk.ui.screens.ImageGeneration.ImageGenerationScreen
+import com.android.everytalk.ui.screens.appinfo.AppInfoScreen
+import com.android.everytalk.ui.screens.appinfo.DataManagementScreen
+import com.android.everytalk.ui.screens.appinfo.PrivacyPolicyScreen
+import com.android.everytalk.ui.screens.settings.SettingsScreen
+import com.android.everytalk.ui.components.splash.PixelPenguinSplash
+import com.android.everytalk.ui.theme.App1Theme
+import com.android.everytalk.util.AgentNotificationManager
+import com.android.everytalk.util.message.MAX_EXTERNAL_TRANSFER_BYTES
+import com.android.everytalk.util.storage.readAtMost
+import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.filter
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.withTimeoutOrNull
+import java.io.IOException
+
+class AppViewModelFactory(
+    private val application: Application
+) : ViewModelProvider.Factory {
+    override fun <T : ViewModel> create(modelClass: Class<T>): T {
+        if (modelClass.isAssignableFrom(AppViewModel::class.java)) {
+            @Suppress("UNCHECKED_CAST")
+            return AppViewModel(application) as T
+        }
+        throw IllegalArgumentException("未知的 ViewModel 类: ${modelClass.name}")
+    }
+}
+
+private val defaultDrawerWidth = 320.dp
+private const val NAVIGATION_ROUTE_WAIT_TIMEOUT_MS = 1_000L
+private const val TRIM_MEMORY_RUNNING_LOW_LEVEL = 10
+private const val SHARED_TEXT_TOO_LARGE_MESSAGE = "分享文本过大（最大 256KB）"
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+internal fun rememberDrawerSessionKey(drawerState: DrawerState): Int {
+    var drawerSessionKey by remember { mutableIntStateOf(0) }
+
+    LaunchedEffect(drawerState) {
+        var wasDrawerActive = drawerState.currentValue != DrawerValue.Closed ||
+            drawerState.targetValue != DrawerValue.Closed
+        var wasDrawerTargetClosed = drawerState.targetValue == DrawerValue.Closed
+
+        snapshotFlow { drawerState.currentValue to drawerState.targetValue }.collect { (currentValue, targetValue) ->
+            val isDrawerActive = currentValue != DrawerValue.Closed || targetValue != DrawerValue.Closed
+            val isDrawerTargetClosed = targetValue == DrawerValue.Closed
+            if ((!wasDrawerActive && isDrawerActive) || (wasDrawerTargetClosed && !isDrawerTargetClosed)) {
+                drawerSessionKey += 1
+            }
+            wasDrawerActive = isDrawerActive
+            wasDrawerTargetClosed = isDrawerTargetClosed
+        }
+    }
+
+    return drawerSessionKey
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+class MainActivity : AppCompatActivity() {
+
+    private var fileContentToSave: String? = null
+    private lateinit var appViewModel: AppViewModel
+    private val createDocument = registerForActivityResult(ActivityResultContracts.CreateDocument("text/markdown")) { uri ->
+        val content = fileContentToSave.also { fileContentToSave = null }
+        if (uri != null && content != null) {
+            lifecycleScope.launch(Dispatchers.IO) {
+                try {
+                    val outputStream = contentResolver.openOutputStream(uri)
+                        ?: throw IOException("无法打开导出文件")
+                    outputStream.use {
+                        it.write(content.toByteArray(Charsets.UTF_8))
+                    }
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    android.util.Log.e("MainActivity", "Failed to save file content", e)
+                }
+            }
+        }
+    }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        
+        // 异步初始化ProfileInstaller
+        lifecycleScope.launch(Dispatchers.IO) {
+            ProfileInstaller.writeProfile(this@MainActivity)
+        }
+        
+        // 处理分享过来的内容（首次启动）
+        handleIncomingShareIntent(intent)
+        
+        WindowCompat.setDecorFitsSystemWindows(window, false)
+        enableEdgeToEdge()
+        
+        // 强制设置导航栏完全透明
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
+            window.isNavigationBarContrastEnforced = false
+        }
+        
+        setContent {
+            App1Theme(dynamicColor = false) {
+                // 根据当前主题动态设置状态栏和导航栏图标颜色
+                var showAnimatedSplash by remember { mutableStateOf(savedInstanceState == null) }
+                var mainContentStarted by remember { mutableStateOf(savedInstanceState != null) }
+                val isDarkTheme = isSystemInDarkTheme()
+                val windowInsetsController = WindowInsetsControllerCompat(window, window.decorView)
+                val useDarkSystemBarIcons = showAnimatedSplash || !isDarkTheme
+                SideEffect {
+                    windowInsetsController.isAppearanceLightNavigationBars = useDarkSystemBarIcons
+                    windowInsetsController.isAppearanceLightStatusBars = useDarkSystemBarIcons
+                }
+
+                Box(modifier = Modifier.fillMaxSize()) {
+                    if (showAnimatedSplash) {
+                        PixelPenguinSplash(
+                            modifier = Modifier.zIndex(1f),
+                            onFinalFrameVisible = { mainContentStarted = true },
+                            onFinished = {
+                                showAnimatedSplash = false
+                                mainContentStarted = true
+                            },
+                        )
+                    }
+
+                    if (mainContentStarted) {
+                    val snackbarHostState = remember { SnackbarHostState() }
+                    val navController = rememberNavController()
+                    val coroutineScope = rememberCoroutineScope()
+
+                    appViewModel = viewModel(
+                        factory = AppViewModelFactory(
+                            application
+                        )
+                    )
+
+                    val expandedDrawerItemIndex by appViewModel.expandedDrawerItemIndex.collectAsState()
+                    val isLoadingHistoryData by appViewModel.isLoadingHistoryData.collectAsState()
+
+                    LaunchedEffect(appViewModel.snackbarMessage, snackbarHostState) {
+                        appViewModel.snackbarMessage.collectLatest { message ->
+                            val localizedMessage = this@MainActivity.localizeUiMessage(message)
+                            if (
+                                localizedMessage.isNotBlank() &&
+                                snackbarHostState.currentSnackbarData?.visuals?.message != localizedMessage
+                            ) {
+                                snackbarHostState.showSnackbar(localizedMessage)
+                            }
+                        }
+                    }
+
+                    LaunchedEffect(Unit) {
+                        appViewModel.exportRequest.collectLatest { (fileName, content) ->
+                            fileContentToSave = content
+                            createDocument.launch(fileName)
+                        }
+                    }
+
+                    Scaffold(
+                        modifier = Modifier.fillMaxSize(),
+                        containerColor = MaterialTheme.colorScheme.background,
+                        contentWindowInsets = WindowInsets(0, 0, 0, 0), // 允许内容延伸到系统栏区域
+                        snackbarHost = {
+                            SnackbarHost(
+                                hostState = snackbarHostState,
+                                modifier = Modifier
+                                    .padding(bottom = 16.dp)
+                                    .windowInsetsPadding(WindowInsets.navigationBars) // 确保Snackbar在导航栏上方
+                            ) { snackbarData ->
+                                Snackbar(snackbarData = snackbarData)
+                            }
+                        }
+                    ) { contentPadding ->
+                        val density = LocalDensity.current
+                        val screenWidthDp = with(density) { LocalWindowInfo.current.containerSize.width.toDp() }
+
+                        // 处理抽屉的返回键逻辑 - 最低优先级，只在抽屉打开时有效
+                        BackHandler(enabled = !appViewModel.drawerState.isClosed) {
+                            coroutineScope.launch {
+                                appViewModel.drawerState.close()
+                            }
+                        }
+
+                        // 🎯 根据代码块滚动状态动态控制抽屉手势
+                        val isCodeBlockScrolling by appViewModel.gestureManager.isCodeBlockScrolling.collectAsState()
+                        val drawerSessionKey = rememberDrawerSessionKey(appViewModel.drawerState)
+
+                        DismissibleNavigationDrawer(
+                            drawerState = appViewModel.drawerState,
+                            gesturesEnabled = !isCodeBlockScrolling, // 代码块滚动时禁用抽屉手势
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .padding(contentPadding),
+                            drawerContent = {
+                                val navBackStackEntryState = navController.currentBackStackEntryAsState()
+                                val currentRoute = navBackStackEntryState.value?.destination?.route
+                                val isImageGenerationMode = currentRoute == Screen.IMAGE_GENERATION_SCREEN
+
+                                suspend fun waitForRoute(route: String) {
+                                    withTimeoutOrNull(NAVIGATION_ROUTE_WAIT_TIMEOUT_MS) {
+                                        snapshotFlow { navBackStackEntryState.value?.destination?.route }
+                                            .filter { it == route }
+                                            .first()
+                                    }
+                                }
+
+                                LaunchedEffect(drawerSessionKey, isImageGenerationMode) {
+                                    if (drawerSessionKey > 0 && expandedDrawerItemIndex != null) {
+                                        appViewModel.setExpandedDrawerItemIndex(null)
+                                    }
+                                }
+                                
+                                // 置顶集合状态
+                                val pinnedIds = if (isImageGenerationMode) {
+                                    appViewModel.stateHolder.pinnedImageConversationIds.collectAsState().value
+                                } else {
+                                    appViewModel.stateHolder.pinnedTextConversationIds.collectAsState().value
+                                }
+
+                                key(drawerSessionKey, isImageGenerationMode) {
+                                    AppDrawerContent(
+                                        historicalConversations = if (isImageGenerationMode) appViewModel.imageGenerationHistoricalConversations.collectAsState().value else appViewModel.historicalConversations.collectAsState().value,
+                                        loadedHistoryIndex = if (isImageGenerationMode) appViewModel.loadedImageGenerationHistoryIndex.collectAsState().value else appViewModel.loadedHistoryIndex.collectAsState().value,
+                                        onConversationSearchClick = {
+                                            appViewModel.simpleModeManager.setIntendedMode(
+                                                SimpleModeManager.ModeType.TEXT,
+                                                showToast = false,
+                                            )
+                                            appViewModel.setConversationSearchActive(true)
+                                            navController.navigate(Screen.CHAT_SCREEN) {
+                                                popUpTo(navController.graph.startDestinationRoute!!) {
+                                                    saveState = true
+                                                }
+                                                launchSingleTop = true
+                                                restoreState = true
+                                            }
+                                            coroutineScope.launch {
+                                                appViewModel.drawerState.close()
+                                            }
+                                        },
+                                        onImageGenerationConversationClick = { index ->
+                                        // 先声明意图模式，避免因内容/索引造成的误判
+                                        // 跨模式点击时显示 Toast 提示
+                                        appViewModel.simpleModeManager.setIntendedMode(SimpleModeManager.ModeType.IMAGE, showToast = !isImageGenerationMode)
+                                        // 跨模式点击时，先跳转到图像生成页
+                                        if (!isImageGenerationMode) {
+                                            navController.navigate(Screen.IMAGE_GENERATION_SCREEN) {
+                                                popUpTo(navController.graph.startDestinationRoute!!) {
+                                                    saveState = true
+                                                }
+                                                launchSingleTop = true
+                                                restoreState = true
+                                            }
+                                            coroutineScope.launch {
+                                                // 等待目标 route 生效，超时后仍加载以避免操作卡住。
+                                                waitForRoute(Screen.IMAGE_GENERATION_SCREEN)
+                                                // 🔥 修复：不清除文本模式索引，保持两个模式独立
+                                                // appViewModel.stateHolder._loadedHistoryIndex.value = null
+                                                appViewModel.loadImageGenerationConversationFromHistory(index)
+                                                appViewModel.drawerState.close()
+                                            }
+                                        } else {
+                                            // 同模式内点击，直接加载
+                                            // 🔥 修复：不清除文本模式索引，保持两个模式独立
+                                            // appViewModel.stateHolder._loadedHistoryIndex.value = null
+                                            appViewModel.loadImageGenerationConversationFromHistory(index)
+                                            coroutineScope.launch { appViewModel.drawerState.close() }
+                                        }
+                                    },
+                                    onConversationClick = { index ->
+                                        // 先声明意图模式，避免因内容/索引造成的误判
+                                        // 跨模式点击时显示 Toast 提示
+                                        appViewModel.simpleModeManager.setIntendedMode(SimpleModeManager.ModeType.TEXT, showToast = isImageGenerationMode)
+                                        // 跨模式点击时，先跳转到文本聊天页
+                                        if (isImageGenerationMode) {
+                                            navController.navigate(Screen.CHAT_SCREEN) {
+                                                popUpTo(navController.graph.startDestinationRoute!!) {
+                                                    saveState = true
+                                                }
+                                                launchSingleTop = true
+                                                restoreState = true
+                                            }
+                                            coroutineScope.launch {
+                                                // 等待目标 route 生效，超时后仍加载以避免操作卡住。
+                                                waitForRoute(Screen.CHAT_SCREEN)
+                                                // 🔥 修复：不清除图像模式索引，保持两个模式独立
+                                                // appViewModel.stateHolder._loadedImageGenerationHistoryIndex.value = null
+                                                appViewModel.loadConversationFromHistory(index)
+                                                appViewModel.drawerState.close()
+                                            }
+                                        } else {
+                                            // 同模式内点击，直接加载
+                                            // 🔥 修复：不清除图像模式索引，保持两个模式独立
+                                            // appViewModel.stateHolder._loadedImageGenerationHistoryIndex.value = null
+                                            appViewModel.loadConversationFromHistory(index)
+                                            coroutineScope.launch { appViewModel.drawerState.close() }
+                                        }
+                                    },
+                                    onNewChatClick = {
+                                        if (isImageGenerationMode) {
+                                            // 从图像模式切换到文本模式，显示 Toast
+                                            appViewModel.simpleModeManager.setIntendedMode(SimpleModeManager.ModeType.TEXT, showToast = true)
+                                            coroutineScope.launch { appViewModel.drawerState.close() }
+                                            // 🔥 修复：不清除图像模式索引，保持两个模式独立
+                                            // appViewModel.stateHolder._loadedImageGenerationHistoryIndex.value = null
+                                            navController.navigate(Screen.CHAT_SCREEN) {
+                                                popUpTo(navController.graph.startDestinationRoute!!) {
+                                                    saveState = true
+                                                }
+                                                launchSingleTop = true
+                                                restoreState = true
+                                            }
+                                            appViewModel.startNewChat()
+                                        } else {
+                                            appViewModel.startNewChat()
+                                        }
+                                        coroutineScope.launch { appViewModel.drawerState.close() }
+                                    },
+                                    onRenameRequest = { index, newName ->
+                                        appViewModel.renameConversation(
+                                            index,
+                                            newName,
+                                            isImageGeneration = isImageGenerationMode
+                                        )
+                                    },
+                                    onDeleteRequest = { index ->
+                                        if (isImageGenerationMode) {
+                                            appViewModel.deleteImageGenerationConversation(index)
+                                        } else {
+                                            appViewModel.deleteConversation(index)
+                                        }
+                                    },
+                                    onClearAllConversationsRequest = appViewModel::clearAllConversations,
+                                    onClearAllImageGenerationConversationsRequest = appViewModel::clearAllImageGenerationConversations,
+                                    showClearImageHistoryDialog = appViewModel.showClearImageHistoryDialog.collectAsState().value,
+                                    onShowClearImageHistoryDialog = appViewModel::showClearImageHistoryDialog,
+                                    onDismissClearImageHistoryDialog = appViewModel::dismissClearImageHistoryDialog,
+                                    getPreviewForIndex = { index ->
+                                        appViewModel.getConversationPreviewText(
+                                            index,
+                                            isImageGenerationMode
+                                        )
+                                    },
+                                    getFullTextForIndex = { index ->
+                                        appViewModel.getConversationFullText(
+                                            index,
+                                            isImageGenerationMode
+                                        )
+                                    },
+                                    onAppInfoClick = {
+                                        navController.navigate(Screen.APP_INFO_SCREEN) {
+                                            launchSingleTop = true
+                                        }
+                                        coroutineScope.launch {
+                                            appViewModel.drawerState.close()
+                                        }
+                                    },
+                                    onImageGenerationClick = {
+                                        // 从文本模式切换到图像模式，显示 Toast
+                                        appViewModel.simpleModeManager.setIntendedMode(SimpleModeManager.ModeType.IMAGE, showToast = !isImageGenerationMode)
+                                        coroutineScope.launch { appViewModel.drawerState.close() }
+                                        // 🔥 修复：不清除文本模式索引，保持两个模式独立
+                                        // appViewModel.stateHolder._loadedHistoryIndex.value = null
+                                        navController.navigate(Screen.IMAGE_GENERATION_SCREEN) {
+                                            popUpTo(navController.graph.startDestinationRoute!!) {
+                                                saveState = true
+                                            }
+                                            launchSingleTop = true
+                                            restoreState = true
+                                        }
+                                        appViewModel.startNewImageGeneration()
+                                    },
+                                    isLoadingHistoryData = isLoadingHistoryData,
+                                    isImageGenerationMode = isImageGenerationMode,
+                                    expandedItemIndex = expandedDrawerItemIndex,
+                                    onExpandItem = { index -> appViewModel.setExpandedDrawerItemIndex(index) },
+                                    pinnedIds = pinnedIds,
+                                    onTogglePin = { index ->
+                                        appViewModel.togglePinForConversation(index, isImageGenerationMode)
+                                    },
+                                    conversationGroups = appViewModel.stateHolder.conversationGroups.collectAsState().value,
+                                    onCreateGroup = { groupName -> appViewModel.createGroup(groupName) },
+                                    onRenameGroup = { oldName, newName -> appViewModel.renameGroup(oldName, newName) },
+                                    onDeleteGroup = { groupName -> appViewModel.deleteGroup(groupName) },
+                                    onMoveConversationToGroup = { index, groupName, isImageGen -> appViewModel.moveConversationToGroup(index, groupName, isImageGen) },
+                                    expandedGroups = appViewModel.stateHolder.expandedGroups.collectAsState().value,
+                                    onToggleGroup = { groupKey -> appViewModel.toggleGroupExpanded(groupKey) },
+                                    isGroupSectionExpanded = appViewModel.stateHolder.isGroupSectionExpanded.collectAsState().value,
+                                    onToggleGroupSection = { appViewModel.toggleGroupSectionExpanded() },
+                                    onShareConversation = { index ->
+                                        appViewModel.shareConversation(index, isImageGenerationMode)
+                                    }
+                                    )
+                                }
+                            }
+                        ) {
+                            NavHost(
+                                navController = navController,
+                                startDestination = Screen.CHAT_SCREEN,
+                                modifier = Modifier
+                                    .fillMaxSize()
+                            ) {
+                                composable(
+                                    route = Screen.CHAT_SCREEN,
+                                    enterTransition = {
+                                        androidx.compose.animation.fadeIn(
+                                            animationSpec = tween(
+                                                durationMillis = 280,
+                                                easing = FastOutSlowInEasing
+                                            )
+                                        )
+                                    },
+                                    exitTransition = {
+                                        androidx.compose.animation.fadeOut(
+                                            animationSpec = tween(
+                                                durationMillis = 220,
+                                                easing = FastOutSlowInEasing
+                                            )
+                                        )
+                                    },
+                                    popEnterTransition = {
+                                        androidx.compose.animation.fadeIn(
+                                            animationSpec = tween(
+                                                durationMillis = 280,
+                                                easing = FastOutSlowInEasing
+                                            )
+                                        )
+                                    },
+                                    popExitTransition = {
+                                        androidx.compose.animation.fadeOut(
+                                            animationSpec = tween(
+                                                durationMillis = 220,
+                                                easing = FastOutSlowInEasing
+                                            )
+                                        )
+                                    }
+                                ) {
+                                    ChatScreen(viewModel = appViewModel, navController = navController)
+                                }
+                               composable(
+                                   route = Screen.IMAGE_GENERATION_SCREEN,
+                                   enterTransition = {
+                                       androidx.compose.animation.fadeIn(
+                                           animationSpec = tween(
+                                               durationMillis = 280,
+                                               easing = FastOutSlowInEasing
+                                           )
+                                       )
+                                   },
+                                   exitTransition = {
+                                       androidx.compose.animation.fadeOut(
+                                           animationSpec = tween(
+                                               durationMillis = 220,
+                                               easing = FastOutSlowInEasing
+                                           )
+                                       )
+                                   },
+                                   popEnterTransition = {
+                                       androidx.compose.animation.fadeIn(
+                                           animationSpec = tween(
+                                               durationMillis = 280,
+                                               easing = FastOutSlowInEasing
+                                           )
+                                       )
+                                   },
+                                   popExitTransition = {
+                                       androidx.compose.animation.fadeOut(
+                                           animationSpec = tween(
+                                               durationMillis = 220,
+                                               easing = FastOutSlowInEasing
+                                           )
+                                       )
+                                   }
+                               ) {
+                                    ImageGenerationScreen(viewModel = appViewModel, navController = navController)
+                               }
+                                composable(
+                                    route = Screen.SETTINGS_SCREEN,
+                                    enterTransition = {
+                                        androidx.compose.animation.slideInHorizontally(
+                                            initialOffsetX = { fullWidth -> fullWidth },
+                                            animationSpec = tween(300, easing = FastOutSlowInEasing)
+                                        )
+                                    },
+                                    exitTransition = {
+                                        androidx.compose.animation.slideOutHorizontally(
+                                            targetOffsetX = { fullWidth -> fullWidth },
+                                            animationSpec = tween(300, easing = FastOutSlowInEasing)
+                                        )
+                                    },
+                                    popEnterTransition = {
+                                        androidx.compose.animation.slideInHorizontally(
+                                            initialOffsetX = { fullWidth -> fullWidth },
+                                            animationSpec = tween(300, easing = FastOutSlowInEasing)
+                                        )
+                                    },
+                                    popExitTransition = {
+                                        androidx.compose.animation.slideOutHorizontally(
+                                            targetOffsetX = { fullWidth -> fullWidth },
+                                            animationSpec = tween(300, easing = FastOutSlowInEasing)
+                                        )
+                                    }
+                                 ) {
+                                     SettingsScreen(
+                                         viewModel = appViewModel,
+                                         navController = navController
+                                     )
+                                 }
+                                composable(
+                                    route = Screen.COMPUTER_SCREEN,
+                                    enterTransition = {
+                                        androidx.compose.animation.slideInHorizontally(
+                                            initialOffsetX = { fullWidth -> fullWidth },
+                                            animationSpec = tween(300, easing = FastOutSlowInEasing),
+                                        )
+                                    },
+                                    exitTransition = {
+                                        androidx.compose.animation.slideOutHorizontally(
+                                            targetOffsetX = { fullWidth -> -fullWidth / 4 },
+                                            animationSpec = tween(300, easing = FastOutSlowInEasing),
+                                        )
+                                    },
+                                    popEnterTransition = {
+                                        androidx.compose.animation.slideInHorizontally(
+                                            initialOffsetX = { fullWidth -> -fullWidth / 4 },
+                                            animationSpec = tween(300, easing = FastOutSlowInEasing),
+                                        )
+                                    },
+                                    popExitTransition = {
+                                        androidx.compose.animation.slideOutHorizontally(
+                                            targetOffsetX = { fullWidth -> fullWidth },
+                                            animationSpec = tween(300, easing = FastOutSlowInEasing),
+                                        )
+                                    },
+                                ) {
+                                    com.android.everytalk.ui.screens.computer.ComputerNeutralTheme {
+                                        com.android.everytalk.ui.screens.computer.ComputerScreen(
+                                            viewModel = appViewModel,
+                                            navController = navController,
+                                        )
+                                    }
+                                }
+                                composable(
+                                    route = Screen.COMPUTER_DETAIL_SCREEN,
+                                    arguments = listOf(
+                                        androidx.navigation.navArgument("computerId") {
+                                            type = androidx.navigation.NavType.StringType
+                                        },
+                                    ),
+                                    enterTransition = {
+                                        androidx.compose.animation.slideInHorizontally(
+                                            initialOffsetX = { fullWidth -> fullWidth },
+                                            animationSpec = tween(300, easing = FastOutSlowInEasing),
+                                        )
+                                    },
+                                    exitTransition = {
+                                        androidx.compose.animation.slideOutHorizontally(
+                                            targetOffsetX = { fullWidth -> fullWidth },
+                                            animationSpec = tween(300, easing = FastOutSlowInEasing),
+                                        )
+                                    },
+                                    popEnterTransition = {
+                                        androidx.compose.animation.slideInHorizontally(
+                                            initialOffsetX = { fullWidth -> -fullWidth / 4 },
+                                            animationSpec = tween(300, easing = FastOutSlowInEasing),
+                                        )
+                                    },
+                                    popExitTransition = {
+                                        androidx.compose.animation.slideOutHorizontally(
+                                            targetOffsetX = { fullWidth -> fullWidth },
+                                            animationSpec = tween(300, easing = FastOutSlowInEasing),
+                                        )
+                                    },
+                                ) { entry ->
+                                    val computerId = entry.arguments?.getString("computerId").orEmpty()
+                                    com.android.everytalk.ui.screens.computer.ComputerNeutralTheme {
+                                        com.android.everytalk.ui.screens.computer.ComputerDetailScreen(
+                                            viewModel = appViewModel,
+                                            navController = navController,
+                                            computerId = computerId,
+                                        )
+                                    }
+                                }
+                                composable(route = Screen.SKILL_SCREEN) {
+                                    com.android.everytalk.ui.screens.skill.SkillScreen(navController = navController)
+                                }
+                                composable(route = Screen.SKILL_DOWNLOAD_SCREEN) {
+                                    com.android.everytalk.ui.screens.skill.SkillDownloadScreen(navController = navController)
+                                }
+                                composable(route = Screen.SKILL_DETAIL_SCREEN) { entry ->
+                                    com.android.everytalk.ui.screens.skill.SkillDetailScreen(
+                                        navController = navController,
+                                        skillId = entry.arguments?.getString("skillId").orEmpty(),
+                                    )
+                                }
+                                composable(
+                                    route = Screen.APP_INFO_SCREEN,
+                                    enterTransition = {
+                                        androidx.compose.animation.slideInHorizontally(
+                                            initialOffsetX = { fullWidth -> fullWidth },
+                                            animationSpec = tween(300, easing = FastOutSlowInEasing),
+                                        )
+                                    },
+                                    exitTransition = {
+                                        androidx.compose.animation.slideOutHorizontally(
+                                            targetOffsetX = { fullWidth -> -fullWidth / 4 },
+                                            animationSpec = tween(300, easing = FastOutSlowInEasing),
+                                        )
+                                    },
+                                    popEnterTransition = {
+                                        androidx.compose.animation.slideInHorizontally(
+                                            initialOffsetX = { fullWidth -> -fullWidth / 4 },
+                                            animationSpec = tween(300, easing = FastOutSlowInEasing),
+                                        )
+                                    },
+                                    popExitTransition = {
+                                        androidx.compose.animation.slideOutHorizontally(
+                                            targetOffsetX = { fullWidth -> fullWidth },
+                                            animationSpec = tween(300, easing = FastOutSlowInEasing),
+                                        )
+                                    },
+                                ) {
+                                    AppInfoScreen(
+                                        onBack = { navController.popBackStack() },
+                                        onOpenDataManagement = {
+                                            navController.navigate(Screen.DATA_MANAGEMENT_SCREEN) {
+                                                launchSingleTop = true
+                                            }
+                                        },
+                                        onOpenPrivacyPolicy = {
+                                            navController.navigate(Screen.PRIVACY_POLICY_SCREEN) {
+                                                launchSingleTop = true
+                                            }
+                                        },
+                                    )
+                                }
+                                composable(
+                                    route = Screen.DATA_MANAGEMENT_SCREEN,
+                                    enterTransition = {
+                                        androidx.compose.animation.slideInHorizontally(
+                                            initialOffsetX = { fullWidth -> fullWidth },
+                                            animationSpec = tween(300, easing = FastOutSlowInEasing),
+                                        )
+                                    },
+                                    exitTransition = {
+                                        androidx.compose.animation.slideOutHorizontally(
+                                            targetOffsetX = { fullWidth -> -fullWidth / 4 },
+                                            animationSpec = tween(300, easing = FastOutSlowInEasing),
+                                        )
+                                    },
+                                    popEnterTransition = {
+                                        androidx.compose.animation.slideInHorizontally(
+                                            initialOffsetX = { fullWidth -> -fullWidth / 4 },
+                                            animationSpec = tween(300, easing = FastOutSlowInEasing),
+                                        )
+                                    },
+                                    popExitTransition = {
+                                        androidx.compose.animation.slideOutHorizontally(
+                                            targetOffsetX = { fullWidth -> fullWidth },
+                                            animationSpec = tween(300, easing = FastOutSlowInEasing),
+                                        )
+                                    },
+                                ) {
+                                    DataManagementScreen(
+                                        onBack = { navController.popBackStack() },
+                                        onDeleteConversations = { selectedIds ->
+                                            val textIndexes = appViewModel.historicalConversations.value
+                                                .mapIndexedNotNull { index, conversation ->
+                                                    index.takeIf {
+                                                        appViewModel.resolveStableConversationId(conversation) in selectedIds
+                                                    }
+                                                }
+                                                .sortedDescending()
+                                            val imageIndexes = appViewModel.imageGenerationHistoricalConversations.value
+                                                .mapIndexedNotNull { index, conversation ->
+                                                    index.takeIf {
+                                                        appViewModel.resolveStableConversationId(conversation) in selectedIds
+                                                    }
+                                                }
+                                                .sortedDescending()
+                                            // 先删较大的索引，前面的索引不会因列表收缩而漂移。
+                                            textIndexes.forEach(appViewModel::deleteConversation)
+                                            imageIndexes.forEach(appViewModel::deleteImageGenerationConversation)
+                                            delay(500)
+                                        },
+                                    )
+                                }
+                                composable(
+                                    route = Screen.PRIVACY_POLICY_SCREEN,
+                                    enterTransition = {
+                                        androidx.compose.animation.slideInHorizontally(
+                                            initialOffsetX = { fullWidth -> fullWidth },
+                                            animationSpec = tween(300, easing = FastOutSlowInEasing),
+                                        )
+                                    },
+                                    exitTransition = {
+                                        androidx.compose.animation.slideOutHorizontally(
+                                            targetOffsetX = { fullWidth -> -fullWidth / 4 },
+                                            animationSpec = tween(300, easing = FastOutSlowInEasing),
+                                        )
+                                    },
+                                    popEnterTransition = {
+                                        androidx.compose.animation.slideInHorizontally(
+                                            initialOffsetX = { fullWidth -> -fullWidth / 4 },
+                                            animationSpec = tween(300, easing = FastOutSlowInEasing),
+                                        )
+                                    },
+                                    popExitTransition = {
+                                        androidx.compose.animation.slideOutHorizontally(
+                                            targetOffsetX = { fullWidth -> fullWidth },
+                                            animationSpec = tween(300, easing = FastOutSlowInEasing),
+                                        )
+                                    },
+                                ) {
+                                    PrivacyPolicyScreen(
+                                        onBack = { navController.popBackStack() },
+                                    )
+                                }
+                                 composable(
+                                     route = Screen.IMAGE_GENERATION_SETTINGS_SCREEN,
+                                    enterTransition = {
+                                        androidx.compose.animation.slideInHorizontally(
+                                            initialOffsetX = { fullWidth -> fullWidth },
+                                            animationSpec = tween(300, easing = FastOutSlowInEasing)
+                                        )
+                                    },
+                                    exitTransition = {
+                                        androidx.compose.animation.slideOutHorizontally(
+                                            targetOffsetX = { fullWidth -> fullWidth },
+                                            animationSpec = tween(300, easing = FastOutSlowInEasing)
+                                        )
+                                    },
+                                    popEnterTransition = {
+                                        androidx.compose.animation.slideInHorizontally(
+                                            initialOffsetX = { fullWidth -> fullWidth },
+                                            animationSpec = tween(300, easing = FastOutSlowInEasing)
+                                        )
+                                    },
+                                    popExitTransition = {
+                                        androidx.compose.animation.slideOutHorizontally(
+                                            targetOffsetX = { fullWidth -> fullWidth },
+                                            animationSpec = tween(300, easing = FastOutSlowInEasing)
+                                        )
+                                    }
+                                ) {
+                                    com.android.everytalk.ui.screens.ImageGeneration.ImageGenerationSettingsScreen(
+                                        viewModel = appViewModel,
+                                        navController = navController
+                                    )
+                                }
+                               composable(
+                                   route = Screen.VOICE_INPUT_SCREEN,
+                                   enterTransition = {
+                                       androidx.compose.animation.slideInHorizontally(
+                                           initialOffsetX = { fullWidth -> fullWidth },
+                                           animationSpec = tween(300, easing = FastOutSlowInEasing)
+                                       )
+                                   },
+                                   exitTransition = {
+                                       androidx.compose.animation.slideOutHorizontally(
+                                           targetOffsetX = { fullWidth -> fullWidth },
+                                           animationSpec = tween(300, easing = FastOutSlowInEasing)
+                                       )
+                                   },
+                                   popEnterTransition = {
+                                       androidx.compose.animation.slideInHorizontally(
+                                           initialOffsetX = { fullWidth -> fullWidth },
+                                           animationSpec = tween(300, easing = FastOutSlowInEasing)
+                                       )
+                                   },
+                                   popExitTransition = {
+                                       androidx.compose.animation.slideOutHorizontally(
+                                           targetOffsetX = { fullWidth -> fullWidth },
+                                           animationSpec = tween(300, easing = FastOutSlowInEasing)
+                                       )
+                                   }
+                               ) {
+                                   val selectedApiConfig by appViewModel.selectedApiConfig.collectAsState()
+                                   com.android.everytalk.ui.screens.MainScreen.chat.voice.ui.VoiceInputScreen(
+                                      onClose = { navController.popBackStack() },
+                                      selectedApiConfig = selectedApiConfig,
+                                      viewModel = appViewModel
+                                   )
+                               }
+                            }
+                            com.android.everytalk.ui.screens.computer.ComputerNeutralTheme {
+                                com.android.everytalk.ui.screens.computer.ComputerPublicPreviewConfirmationDialog(
+                                    viewModel = appViewModel,
+                                )
+                            }
+                        }
+               }
+                    }
+                }
+           }
+       }
+   }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        // 处理分享过来的内容（应用已在运行时）
+        handleIncomingShareIntent(intent)
+    }
+    
+    /**
+     * 处理系统分享过来的文本内容
+     * 支持两种方式：
+     * 1. 直接分享文本（EXTRA_TEXT）
+     * 2. 分享文本文件（EXTRA_STREAM）- 读取文件内容
+     */
+    private fun handleIncomingShareIntent(intent: Intent?) {
+        if (intent?.action != Intent.ACTION_SEND) return
+
+        val streamUri: Uri? = IntentCompat.getParcelableExtra(intent, Intent.EXTRA_STREAM, Uri::class.java)
+        when {
+            streamUri != null && intent.type?.startsWith("text/") == true -> {
+                lifecycleScope.launch(Dispatchers.IO) {
+                    readSharedTextFile(streamUri)
+                }
+            }
+            // 处理直接分享的文本
+            intent.type == "text/plain" -> {
+                intent.getStringExtra(Intent.EXTRA_TEXT)?.let { sharedText ->
+                    if (sharedText.isNotBlank()) {
+                        lifecycleScope.launch {
+                            // 等待 ViewModel 初始化完成
+                            while (!::appViewModel.isInitialized) {
+                                kotlinx.coroutines.delay(50)
+                            }
+                            if (
+                                sharedText.length > MAX_EXTERNAL_TRANSFER_BYTES ||
+                                sharedText.toByteArray(Charsets.UTF_8).size > MAX_EXTERNAL_TRANSFER_BYTES
+                            ) {
+                                appViewModel.showSnackbar(SHARED_TEXT_TOO_LARGE_MESSAGE)
+                            } else {
+                                appViewModel.onTextChange(sharedText)
+                                appViewModel.showSnackbar("已接收分享内容")
+                            }
+                        }
+                    }
+                }
+            }
+            // 处理分享的文本文件
+            intent.type?.startsWith("text/") == true -> {
+                // 兼容只声明 text/* 但没有正文/文件流的分享 Intent。
+            }
+        }
+    }
+
+    private suspend fun readSharedTextFile(fileUri: Uri) {
+        try {
+            val content = contentResolver.openInputStream(fileUri)?.use { inputStream ->
+                readAtMost(inputStream, MAX_EXTERNAL_TRANSFER_BYTES.toLong()).toString(Charsets.UTF_8)
+            }
+            if (!content.isNullOrBlank()) {
+                kotlinx.coroutines.withContext(Dispatchers.Main) {
+                    while (!::appViewModel.isInitialized) {
+                        kotlinx.coroutines.delay(50)
+                    }
+                    appViewModel.onTextChange(content)
+                    appViewModel.showSnackbar("已接收分享文件内容")
+                }
+            }
+        } catch (e: IllegalArgumentException) {
+            kotlinx.coroutines.withContext(Dispatchers.Main) {
+                if (::appViewModel.isInitialized) {
+                    appViewModel.showSnackbar(SHARED_TEXT_TOO_LARGE_MESSAGE)
+                }
+            }
+        } catch (e: Exception) {
+            android.util.Log.e("MainActivity", "读取分享文件失败", e)
+            kotlinx.coroutines.withContext(Dispatchers.Main) {
+                if (::appViewModel.isInitialized) {
+                    appViewModel.showSnackbar("读取文件失败: ${e.message}")
+                }
+            }
+        }
+    }
+   
+   override fun onStart() {
+       super.onStart()
+       // 先立即禁止新的事件通知，再在后台清理通知栏。
+       // 系统通知查询属于跨进程调用，放在主线程会让回前台动画和整个聊天页面一起卡住。
+       AgentNotificationManager.markAppForeground()
+       lifecycleScope.launch(Dispatchers.IO) {
+           AgentNotificationManager.clearForegroundEventNotifications(applicationContext)
+       }
+       if (this::appViewModel.isInitialized) {
+           appViewModel.retryPendingAiContentReports()
+           appViewModel.reconcileVisibleAgentState()
+       }
+   }
+
+   override fun onStop() {
+       super.onStop()
+       AgentNotificationManager.onAppBackground()
+       if (this::appViewModel.isInitialized) {
+           appViewModel.onAppStop()
+       }
+   }
+   
+   /**
+    *  低内存回调 - 清理缓存
+    */
+   override fun onTrimMemory(level: Int) {
+       super.onTrimMemory(level)
+       
+       // 中等及以上内存压力时清理缓存
+       if (level >= TRIM_MEMORY_RUNNING_LOW_LEVEL) {
+           if (this::appViewModel.isInitialized) {
+               appViewModel.onLowMemory()
+           }
+       }
+   }
+   
+}

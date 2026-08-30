@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <style>
+        * { box-sizing: border-box; }
+        html, body {
+            margin: 0;
+            padding: 0;
+            width: 100%;
+            height: 100%;
+            color-scheme: ET_COLOR_SCHEME;
+        }
+        body {
+            padding: 56px 12px 24px 12px;
+            display: flex;
+            align-items: safe center;
+            justify-content: safe center;
+            background-color: ET_BACKGROUND_COLOR;
+            color: ET_TEXT_COLOR;
+            overflow: auto;
+            -webkit-overflow-scrolling: touch;
+        }
+        .preview-container {
+            width: 100%;
+            min-height: calc(100vh - 80px);
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: safe center;
+        }
+        .preview-container > *,
+        .preview-container img,
+        .preview-container canvas,
+        .preview-container svg,
+        .preview-container iframe {
+            max-width: 100% !important;
+            margin-left: auto !important;
+            margin-right: auto !important;
+        }
+    </style>
+</head>
+<body class="ET_THEME_CLASS">
+    <div class="preview-container">
+        <!-- CONTENT_PLACEHOLDER -->
+    </div>
+    <style id="everytalk-preview-override">
+        html, body {
+            width: 100% !important;
+            min-height: 100% !important;
+            margin: 0 !important;
+        }
+        body {
+            display: flex !important;
+            align-items: safe center !important;
+            justify-content: safe center !important;
+            padding: 56px 12px 24px 12px !important;
+            background-color: ET_BACKGROUND_COLOR !important;
+            color: ET_TEXT_COLOR !important;
+            overflow: auto !important;
+        }
+        .preview-container {
+            width: 100% !important;
+            min-height: calc(100vh - 80px) !important;
+            display: flex !important;
+            flex-direction: column !important;
+            align-items: center !important;
+            justify-content: safe center !important;
+        }
+        .preview-container > *,
+        .preview-container img,
+        .preview-container canvas,
+        .preview-container svg,
+        .preview-container iframe {
+            max-width: 100% !important;
+            margin-left: auto !important;
+            margin-right: auto !important;
+        }
+        .preview-container img,
+        .preview-container canvas,
+        .preview-container svg {
+            height: auto !important;
+        }
+        ET_DARK_MODE_OVERRIDES
+    </style>
+</body>
+</html>

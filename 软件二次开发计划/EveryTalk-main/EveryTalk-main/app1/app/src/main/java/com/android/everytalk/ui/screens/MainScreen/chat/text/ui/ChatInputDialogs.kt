@@ -1,0 +1,319 @@
+package com.android.everytalk.ui.screens.MainScreen.chat.text.ui
+import com.android.everytalk.statecontroller.*
+
+import kotlin.math.max
+import android.Manifest
+import android.content.Context
+import android.net.Uri
+import android.provider.OpenableColumns
+import android.util.Log
+import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.PickVisualMediaRequest
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.animateContentSize
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.animateDpAsState
+import androidx.compose.animation.core.spring
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.scaleIn
+import androidx.compose.animation.scaleOut
+import androidx.compose.animation.togetherWith
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.isImeVisible
+import androidx.compose.foundation.layout.windowInsetsPadding
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.border
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.isSystemInDarkTheme
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.ui.draw.shadow
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.GraphicEq
+import androidx.compose.material.icons.filled.Code
+import androidx.compose.material.icons.filled.Clear
+import androidx.compose.material.icons.filled.Language
+import androidx.compose.material.icons.filled.Tune
+import androidx.compose.material.icons.outlined.Image
+import androidx.compose.material.icons.filled.KeyboardArrowUp
+import androidx.compose.material.icons.filled.Stop
+import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.res.stringResource
+import com.android.everytalk.R
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.text.TextRange
+import androidx.compose.ui.text.input.TextFieldValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.TransformOrigin
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.platform.SoftwareKeyboardController
+import androidx.compose.ui.unit.Density
+import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.unit.IntRect
+import androidx.compose.ui.unit.IntSize
+import androidx.compose.ui.unit.LayoutDirection
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.compose.ui.zIndex
+import androidx.compose.ui.window.Popup
+import androidx.compose.ui.window.PopupPositionProvider
+import androidx.compose.ui.window.PopupProperties
+import androidx.core.content.FileProvider
+import com.android.everytalk.data.DataClass.ApiConfig
+import com.android.everytalk.models.ImageSourceOption
+import com.android.everytalk.models.MoreOptionsType
+import com.android.everytalk.models.SelectedMediaItem
+import com.android.everytalk.ui.components.modifier.diffuseShadow
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.filter
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import com.android.everytalk.config.PerformanceConfig
+import com.android.everytalk.data.mcp.McpServerState
+import com.android.everytalk.data.mcp.McpServerConfig
+import com.android.everytalk.data.computer.Computer
+import com.android.everytalk.data.computer.ComputerDisclosureKind
+import com.android.everytalk.ui.components.dialog.AppDialogButtonShape
+import com.android.everytalk.ui.components.dialog.AppDialogShape
+import com.android.everytalk.ui.components.dialog.appDialogBorderColor
+import com.android.everytalk.ui.components.dialog.appDialogContainerColor
+import com.android.everytalk.ui.components.dialog.appDialogContentColor
+import com.android.everytalk.ui.screens.mcp.McpServerListDialog
+import java.io.File
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import java.util.UUID
+
+
+@Composable
+internal fun ChatInputDialogs(
+    showMcpServerListDialog: Boolean,
+    onShowMcpServerListDialogChange: (Boolean) -> Unit,
+    viewModel: com.android.everytalk.statecontroller.AppViewModel,
+    mcpServerStates: Map<String, McpServerState>,
+    onAddMcpServer: (McpServerConfig) -> Unit,
+    onRemoveMcpServer: (String) -> Unit,
+    onToggleMcpServer: (String, Boolean) -> Unit,
+    tempCameraImageUri: Uri?,
+    context: Context,
+) {
+    // MCP Server List Dialog
+    if (showMcpServerListDialog) {
+        McpServerListDialog(
+            serverStates = mcpServerStates,
+            onAddServer = onAddMcpServer,
+            onUpdateServer = onAddMcpServer,
+            onRemoveServer = onRemoveMcpServer,
+            onToggleServer = onToggleMcpServer,
+            onDismiss = { onShowMcpServerListDialogChange(false) }
+        )
+    }
+
+    DisposableEffect(Unit) {
+        onDispose {
+            tempCameraImageUri?.let { uri ->
+                safeDeleteTempFile(context, uri)
+            }
+        }
+    }
+}
+
+/** 首次启用 Agent 时按当前服务器权限分层展示风险说明。 */
+@Composable
+internal fun AgentDisclosureDialog(
+    computer: Computer?,
+    disclosures: Set<ComputerDisclosureKind>,
+    onConfirm: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    if (computer == null || disclosures.isEmpty()) return
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        modifier = Modifier.border(1.dp, appDialogBorderColor(), AppDialogShape),
+        shape = AppDialogShape,
+        containerColor = appDialogContainerColor(),
+        titleContentColor = appDialogContentColor(),
+        textContentColor = appDialogContentColor(),
+        title = { Text(stringResource(R.string.agent_disclosure_title)) },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                if (ComputerDisclosureKind.MODEL_DATA_FLOW in disclosures) {
+                    Text(
+                        text = stringResource(R.string.agent_disclosure_model_data),
+                        color = appDialogContentColor().copy(alpha = 0.72f),
+                    )
+                }
+                if (ComputerDisclosureKind.DIRECT_SSH_PERMISSION in disclosures) {
+                    Text(
+                        text = stringResource(R.string.agent_disclosure_direct_permission),
+                        color = appDialogContentColor().copy(alpha = 0.72f),
+                    )
+                }
+                if (ComputerDisclosureKind.ROOT_SSH_PERMISSION in disclosures) {
+                    Text(
+                        text = stringResource(R.string.agent_disclosure_root_permission),
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = onConfirm,
+                shape = AppDialogButtonShape,
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = appDialogContentColor(),
+                    contentColor = appDialogContainerColor(),
+                ),
+            ) {
+                Text(stringResource(R.string.agent_disclosure_confirm))
+            }
+        },
+        dismissButton = {
+            TextButton(
+                onClick = onDismiss,
+                shape = AppDialogButtonShape,
+                colors = ButtonDefaults.textButtonColors(
+                    contentColor = appDialogContentColor(),
+                ),
+            ) {
+                Text(stringResource(R.string.action_cancel))
+            }
+        },
+    )
+}
+
+/** 工作区被用户删除后，必须明确确认才允许为原会话创建新的空工作区。 */
+@Composable
+internal fun AgentWorkspaceRecreationDialog(
+    computerName: String?,
+    detachedWorkspacePath: String?,
+    onConfirm: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        modifier = Modifier.border(1.dp, appDialogBorderColor(), AppDialogShape),
+        shape = AppDialogShape,
+        containerColor = appDialogContainerColor(),
+        titleContentColor = appDialogContentColor(),
+        textContentColor = appDialogContentColor(),
+        title = { Text(stringResource(R.string.agent_workspace_recreate_title)) },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text(
+                    stringResource(
+                        R.string.agent_workspace_recreate_body,
+                        computerName ?: stringResource(R.string.agent_current_server),
+                    ),
+                )
+                detachedWorkspacePath?.let { path ->
+                    Text(
+                        text = stringResource(R.string.agent_workspace_recreate_files_kept, path),
+                        color = appDialogContentColor().copy(alpha = 0.72f),
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = onConfirm,
+                shape = AppDialogButtonShape,
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = appDialogContentColor(),
+                    contentColor = appDialogContainerColor(),
+                ),
+            ) { Text(stringResource(R.string.agent_workspace_recreate_confirm)) }
+        },
+        dismissButton = {
+            TextButton(
+                onClick = onDismiss,
+                shape = AppDialogButtonShape,
+                colors = ButtonDefaults.textButtonColors(contentColor = appDialogContentColor()),
+            ) { Text(stringResource(R.string.action_cancel)) }
+        },
+    )
+}
+
+/** 服务器记录删除后展示会话仍然保留，并把旧文件路径作为只读恢复线索交给用户。 */
+@Composable
+internal fun AgentServerDeletedDialog(
+    computerName: String?,
+    detachedWorkspacePath: String?,
+    onChooseServer: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        modifier = Modifier.border(1.dp, appDialogBorderColor(), AppDialogShape),
+        shape = AppDialogShape,
+        containerColor = appDialogContainerColor(),
+        titleContentColor = appDialogContentColor(),
+        textContentColor = appDialogContentColor(),
+        title = { Text(stringResource(R.string.agent_server_deleted_title)) },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text(
+                    stringResource(
+                        R.string.agent_server_deleted_body,
+                        computerName ?: stringResource(R.string.agent_current_server),
+                    ),
+                )
+                detachedWorkspacePath?.let { path ->
+                    Text(
+                        text = stringResource(R.string.agent_server_deleted_files_kept, path),
+                        color = appDialogContentColor().copy(alpha = 0.72f),
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = onChooseServer,
+                shape = AppDialogButtonShape,
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = appDialogContentColor(),
+                    contentColor = appDialogContainerColor(),
+                ),
+            ) { Text(stringResource(R.string.agent_server_deleted_choose)) }
+        },
+        dismissButton = {
+            TextButton(
+                onClick = onDismiss,
+                shape = AppDialogButtonShape,
+                colors = ButtonDefaults.textButtonColors(contentColor = appDialogContentColor()),
+            ) { Text(stringResource(R.string.action_cancel)) }
+        },
+    )
+}

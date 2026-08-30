@@ -1,0 +1,176 @@
+package com.android.everytalk.ui.screens.MainScreen.chat.core
+
+import com.android.everytalk.data.DataClass.Message
+import com.android.everytalk.data.DataClass.Sender
+import com.android.everytalk.ui.components.streaming.BLOCK_FORMULA_FENCE_LANGUAGE
+import com.android.everytalk.ui.components.streaming.PreparedMarkdownDocument
+import com.android.everytalk.ui.components.streaming.PreparedMessage
+import com.mikepenz.markdown.model.State
+import com.mikepenz.markdown.model.parseMarkdown
+import org.intellij.markdown.MarkdownElementTypes
+import org.intellij.markdown.MarkdownTokenTypes
+import org.intellij.markdown.ast.LeafASTNode
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
+import org.junit.Test
+
+class ChatListItemStableIdTest {
+    @Test
+    fun `AI正文类型切换时保持同一个LazyColumn身份`() {
+        val messageId = "assistant-message"
+        val message = Message(
+            id = messageId,
+            text = "正文",
+            sender = Sender.AI,
+        )
+
+        val stableIds = listOf(
+            ChatListItem.AiMessage(
+                message = message,
+                messageId = messageId,
+                text = message.text,
+                hasReasoning = false,
+            ).stableId,
+            ChatListItem.AiMessageCode(
+                message = message,
+                messageId = messageId,
+                text = message.text,
+                hasReasoning = false,
+            ).stableId,
+            ChatListItem.AiMessageStreaming(
+                messageId = messageId,
+                hasReasoning = false,
+            ).stableId,
+            ChatListItem.AiMessageCodeStreaming(
+                messageId = messageId,
+                hasReasoning = false,
+            ).stableId,
+        )
+
+        assertEquals(listOf(messageId, messageId, messageId, messageId), stableIds)
+    }
+
+    @Test
+    fun `完成态历史AI正文展开为稳定的Markdown分块项`() {
+        val message = Message(
+            id = "history-assistant",
+            text = "# 标题\n\n第一段。\n\n第二段。",
+            sender = Sender.AI,
+        )
+        val preparedMessage = PreparedMessage(
+            markdown = message.text,
+            formulas = emptyMap(),
+            hasPendingFormula = false,
+            contentVersion = 1L,
+        )
+        val state = parseMarkdown(preparedMessage.markdown) as State.Success
+        val document = PreparedMarkdownDocument(
+            state = state,
+            nodes = state.node.children,
+        )
+        val item = ChatListItem.AiMessage(
+            message = message,
+            messageId = message.id,
+            text = message.text,
+            hasReasoning = false,
+            preparedMessage = preparedMessage,
+            preparedMarkdownDocument = document,
+        )
+
+        val expanded = expandStaticAiMessageItem(item)
+        val nodes = expanded.filterIsInstance<ChatListItem.AiMarkdownNode>()
+
+        assertTrue(document.nodes.size > nodes.size)
+        assertFalse(expanded.any { it is ChatListItem.AiMessage })
+        assertEquals(document.nodes, nodes.flatMap { it.nodes })
+        assertTrue(nodes.map { it.stableId }.distinct().size == nodes.size)
+    }
+
+    @Test
+    fun `静态Markdown轻量分块每块最多包含四个可渲染顶层节点`() {
+        val state = parseMarkdown((1..9).joinToString("\n\n") { "第 ${it} 段。" }) as State.Success
+        val nodes = state.node.children
+
+        val blocks = buildStaticMarkdownNodeBlocks(nodes)
+
+        assertEquals(nodes, blocks.flatten())
+        assertEquals(3, blocks.size)
+        assertTrue(
+            blocks.all { block ->
+                block.count { node ->
+                    node.type != MarkdownTokenTypes.EOL &&
+                        node.type != MarkdownTokenTypes.WHITE_SPACE
+                } <= 4
+            }
+        )
+        assertTrue(
+            blocks.none { block ->
+                block.all { node ->
+                    node.type == MarkdownTokenTypes.EOL ||
+                        node.type == MarkdownTokenTypes.WHITE_SPACE
+                }
+            }
+        )
+    }
+
+    @Test
+    fun `连续块级公式按渲染成本合并而不是每条独占Lazy项`() {
+        val markdown = (1..3).joinToString("\n\n") { index ->
+            "```$BLOCK_FORMULA_FENCE_LANGUAGE\nformula-$index\n```"
+        }
+        val state = parseMarkdown(markdown) as State.Success
+        val nodes = state.node.children
+
+        val blocks = buildStaticMarkdownNodeBlocks(
+            nodes = nodes,
+            content = state.content,
+        )
+
+        assertEquals(nodes, blocks.flatten())
+        assertEquals(3, nodes.count { it.type == MarkdownElementTypes.CODE_FENCE })
+        assertEquals(2, blocks.size)
+        assertEquals(
+            2,
+            blocks.first().count { it.type == MarkdownElementTypes.CODE_FENCE },
+        )
+    }
+
+    @Test
+    fun `真实代码块在生产分块路径中仍然独占Lazy项`() {
+        val state = parseMarkdown(
+            "前文。\n\n```kotlin\nprintln(1)\n```\n\n后文。"
+        ) as State.Success
+        val blocks = buildStaticMarkdownNodeBlocks(
+            nodes = state.node.children,
+            content = state.content,
+        )
+        val codeBlock = blocks.single { block ->
+            block.any { it.type == MarkdownElementTypes.CODE_FENCE }
+        }
+
+        assertEquals(3, blocks.size)
+        assertFalse(codeBlock.any { it.type == MarkdownElementTypes.PARAGRAPH })
+    }
+
+    @Test
+    fun `前导空白不会因超长节点预算形成独立分块`() {
+        val leadingEol = LeafASTNode(MarkdownTokenTypes.EOL, 0, 1)
+        val longParagraph = LeafASTNode(MarkdownElementTypes.PARAGRAPH, 1, 2_502)
+
+        val blocks = buildStaticMarkdownNodeBlocks(listOf(leadingEol, longParagraph))
+
+        assertEquals(listOf(listOf(leadingEol, longParagraph)), blocks)
+    }
+
+    @Test
+    fun `独立重节点不会在相邻位置留下纯空白分块`() {
+        val leadingEol = LeafASTNode(MarkdownTokenTypes.EOL, 0, 1)
+        val codeFence = LeafASTNode(MarkdownElementTypes.CODE_FENCE, 1, 101)
+        val trailingEol = LeafASTNode(MarkdownTokenTypes.EOL, 101, 102)
+
+        val blocks = buildStaticMarkdownNodeBlocks(listOf(leadingEol, codeFence, trailingEol))
+
+        assertEquals(listOf(listOf(leadingEol, codeFence, trailingEol)), blocks)
+    }
+}

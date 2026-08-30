@@ -1,0 +1,977 @@
+package com.android.everytalk.ui.topanchor
+
+import androidx.compose.foundation.gestures.scrollBy
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListState
+import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
+import androidx.compose.runtime.withFrameNanos
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.input.nestedscroll.NestedScrollSource
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.test.junit4.v2.createComposeRule
+import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.dp
+import androidx.test.ext.junit.runners.AndroidJUnit4
+import com.android.everytalk.ui.screens.MainScreen.chat.text.state.ChatScrollStateManager
+import com.android.everytalk.ui.screens.MainScreen.chat.text.state.rememberChatScrollStateManager
+import kotlinx.coroutines.launch
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
+import org.junit.Rule
+import org.junit.Test
+import org.junit.runner.RunWith
+import org.koin.core.context.stopKoin
+import org.robolectric.annotation.Config
+import kotlin.math.abs
+import kotlin.math.roundToInt
+
+@RunWith(AndroidJUnit4::class)
+@Config(sdk = [34])
+class TopAnchorReserveEngineComposeTest {
+    @get:Rule
+    val composeRule = createComposeRule()
+
+    private data class HarnessItem(
+        val id: String,
+        val heightDp: Dp
+    )
+
+    @org.junit.After
+    fun tearDown() {
+        stopKoin()
+    }
+
+    @Test
+    fun `initial snap suppresses bottom scroll before reserve is positive`() {
+        val state = TopAnchorReserveEngineState()
+        state.updateRuntime(
+            TopAnchorRuntimeState(
+                phase = TopAnchorPhase.InitialSnap,
+                activeTurn = TopAnchorTurn("u2", "a2", "s1", 2L),
+                reservePx = 0
+            )
+        )
+
+        assertTrue(state.suppressesBottomScroll)
+        assertFalse(state.reservePx > 0)
+    }
+
+    @Test
+    fun `retained reserve keeps a short terminal turn fixed without further bottom scroll`() {
+        composeRule.mainClock.autoAdvance = false
+        val turn = TopAnchorTurn("u2", "a2", "s1", 2L)
+        val items = listOf(
+            HarnessItem("u1", 280.dp),
+            HarnessItem("a1", 720.dp),
+            HarnessItem("u2", 80.dp),
+            HarnessItem("a2", 80.dp),
+        )
+        lateinit var engineState: TopAnchorReserveEngineState
+        lateinit var listState: LazyListState
+        lateinit var finishAnswer: () -> Unit
+        var targetAnchorYPx = 0
+
+        composeRule.setContent {
+            val density = LocalDensity.current
+            var isRunning by remember { mutableStateOf(true) }
+            var showFooter by remember { mutableStateOf(false) }
+            listState = rememberLazyListState()
+            targetAnchorYPx = with(density) { 96.dp.toPx().toInt() }
+            engineState = remember {
+                TopAnchorReserveEngineState().also {
+                    it.updateRuntime(
+                        TopAnchorRuntimeState(
+                            phase = TopAnchorPhase.InitialSnap,
+                            activeTurn = turn,
+                        )
+                    )
+                }
+            }
+            finishAnswer = {
+                showFooter = true
+                isRunning = false
+            }
+
+            RunTopAnchorReserveEngine(
+                state = engineState,
+                listState = listState,
+                anchorIndex = 2,
+                anchorKey = "u2",
+                targetAnchorY = targetAnchorYPx,
+                trailingRealItemIndex = items.lastIndex + if (showFooter) 1 else 0,
+                isRunning = isRunning,
+                config = TopAnchorConfig(
+                    tallAnchorThresholdPx = with(density) { 240.dp.toPx().toInt() },
+                    tallAnchorVisibleHeightPx = targetAnchorYPx,
+                    topInsetPx = targetAnchorYPx,
+                    stableWindowNanos = 1_000_000L,
+                    keepReserveAfterRunEnd = true,
+                    reserveInsideTrailingItem = true,
+                ),
+                enabled = engineState.runtime.hasRuntime,
+                hasResponseTarget = true,
+            )
+
+            LazyColumn(
+                state = listState,
+                modifier = Modifier.height(640.dp),
+                contentPadding = PaddingValues(top = 96.dp, bottom = 80.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                itemsIndexed(items, key = { _, item -> item.id }) { index, item ->
+                    Box(
+                        Modifier
+                            .appendTopAnchorReserve(
+                                if (!showFooter && index == items.lastIndex) engineState.reservePx else 0
+                            )
+                            .height(item.heightDp)
+                    )
+                }
+                if (showFooter) {
+                    item(key = "a2_footer") {
+                        Box(
+                            Modifier
+                                .appendTopAnchorReserve(engineState.reservePx)
+                                .height(36.dp)
+                        )
+                    }
+                }
+            }
+        }
+
+        repeat(12) {
+            composeRule.mainClock.advanceTimeByFrame()
+            composeRule.waitForIdle()
+        }
+
+        var anchorYBeforeCompletion = 0
+        composeRule.runOnIdle {
+            anchorYBeforeCompletion = listState.layoutInfo.visibleItemsInfo
+                .first { it.key == "u2" }
+                .offset - listState.layoutInfo.viewportStartOffset
+            assertEquals(targetAnchorYPx, anchorYBeforeCompletion)
+            finishAnswer()
+        }
+        repeat(8) {
+            composeRule.mainClock.advanceTimeByFrame()
+            composeRule.waitForIdle()
+        }
+
+        composeRule.runOnIdle {
+            val anchor = listState.layoutInfo.visibleItemsInfo.first { it.key == "u2" }
+            val anchorY = anchor.offset - listState.layoutInfo.viewportStartOffset
+            assertEquals(anchorYBeforeCompletion, anchorY)
+            assertEquals(TopAnchorPhase.Retained, engineState.runtime.phase)
+            assertTrue(engineState.reservePx > 0)
+            assertFalse(listState.canScrollForward)
+            assertEquals(items.size + 1, listState.layoutInfo.totalItemsCount)
+        }
+    }
+
+    @Test
+    fun `流式中展开执行详情不会消耗底部预留`() {
+        composeRule.mainClock.autoAdvance = false
+        val turn = TopAnchorTurn("u2", "a2", "s1", 2L)
+        val historyItems = listOf(
+            HarnessItem("u1", 280.dp),
+            HarnessItem("a1", 720.dp),
+            HarnessItem("u2", 80.dp),
+        )
+        lateinit var engineState: TopAnchorReserveEngineState
+        lateinit var expandDetails: () -> Unit
+        lateinit var collapseDetails: () -> Unit
+        var answerHeight by mutableStateOf(80.dp)
+
+        composeRule.setContent {
+            val density = LocalDensity.current
+            val listState = rememberLazyListState()
+            engineState = remember {
+                TopAnchorReserveEngineState().also {
+                    it.updateRuntime(
+                        TopAnchorRuntimeState(
+                            phase = TopAnchorPhase.InitialSnap,
+                            activeTurn = turn,
+                        )
+                    )
+                }
+            }
+            expandDetails = {
+                engineState.updateInteractiveExpansion("a2:tool", expanded = true)
+                answerHeight = 320.dp
+            }
+            collapseDetails = {
+                answerHeight = 80.dp
+                engineState.updateInteractiveExpansion("a2:tool", expanded = false)
+            }
+
+            RunTopAnchorReserveEngine(
+                state = engineState,
+                listState = listState,
+                anchorIndex = 2,
+                anchorKey = "u2",
+                targetAnchorY = with(density) { 96.dp.toPx().toInt() },
+                trailingRealItemIndex = historyItems.size,
+                isRunning = true,
+                config = TopAnchorConfig(
+                    tallAnchorThresholdPx = with(density) { 240.dp.toPx().toInt() },
+                    tallAnchorVisibleHeightPx = with(density) { 96.dp.toPx().toInt() },
+                    topInsetPx = with(density) { 96.dp.toPx().toInt() },
+                    stableWindowNanos = 1_000_000L,
+                    keepReserveAfterRunEnd = true,
+                    reserveInsideTrailingItem = true,
+                ),
+                enabled = engineState.runtime.hasRuntime,
+                hasResponseTarget = true,
+            )
+
+            LazyColumn(
+                state = listState,
+                modifier = Modifier.height(640.dp),
+                contentPadding = PaddingValues(top = 96.dp, bottom = 80.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                itemsIndexed(historyItems, key = { _, item -> item.id }) { _, item ->
+                    Box(Modifier.height(item.heightDp))
+                }
+                item(key = "a2") {
+                    Box(
+                        Modifier
+                            .appendTopAnchorReserve(engineState.reservePx)
+                            .height(answerHeight)
+                    )
+                }
+            }
+        }
+
+        repeat(12) {
+            composeRule.mainClock.advanceTimeByFrame()
+            composeRule.waitForIdle()
+        }
+        var reserveBeforeExpansion = 0
+        composeRule.runOnIdle {
+            reserveBeforeExpansion = engineState.reservePx
+            assertTrue(reserveBeforeExpansion > 0)
+            expandDetails()
+        }
+        repeat(20) {
+            composeRule.mainClock.advanceTimeByFrame()
+            composeRule.waitForIdle()
+        }
+        composeRule.runOnIdle {
+            assertEquals(reserveBeforeExpansion, engineState.reservePx)
+            assertTrue(engineState.runtime.hasRuntime)
+            collapseDetails()
+        }
+        repeat(20) {
+            composeRule.mainClock.advanceTimeByFrame()
+            composeRule.waitForIdle()
+        }
+        composeRule.runOnIdle {
+            assertEquals(reserveBeforeExpansion, engineState.reservePx)
+        }
+    }
+
+    @Test
+    fun `terminal response present on first frame retains anchor runtime`() {
+        composeRule.mainClock.autoAdvance = false
+        val turn = TopAnchorTurn("u2", "a2", "s1", 2L)
+        val items = listOf(
+            HarnessItem("u1", 280.dp),
+            HarnessItem("a1", 720.dp),
+            HarnessItem("u2", 80.dp),
+            HarnessItem("a2", 48.dp),
+        )
+        lateinit var engineState: TopAnchorReserveEngineState
+
+        composeRule.setContent {
+            val density = LocalDensity.current
+            val listState = rememberLazyListState()
+            engineState = remember {
+                TopAnchorReserveEngineState().also {
+                    it.updateRuntime(
+                        TopAnchorRuntimeState(
+                            phase = TopAnchorPhase.InitialSnap,
+                            activeTurn = turn,
+                        )
+                    )
+                }
+            }
+
+            RunTopAnchorReserveEngine(
+                state = engineState,
+                listState = listState,
+                anchorIndex = 2,
+                anchorKey = "u2",
+                targetAnchorY = with(density) { 96.dp.toPx().toInt() },
+                trailingRealItemIndex = items.lastIndex,
+                isRunning = false,
+                config = TopAnchorConfig(
+                    tallAnchorThresholdPx = with(density) { 240.dp.toPx().toInt() },
+                    tallAnchorVisibleHeightPx = with(density) { 96.dp.toPx().toInt() },
+                    topInsetPx = with(density) { 96.dp.toPx().toInt() },
+                    stableWindowNanos = 1_000_000L,
+                    keepReserveAfterRunEnd = true,
+                ),
+                enabled = engineState.runtime.hasRuntime,
+                hasResponseTarget = true,
+            )
+
+            LazyColumn(state = listState, modifier = Modifier.height(640.dp)) {
+                itemsIndexed(items, key = { _, item -> item.id }) { _, item ->
+                    Box(Modifier.height(item.heightDp))
+                }
+                if (engineState.reservePx > 0) {
+                    item(key = "top_anchor_reserve") {
+                        Spacer(Modifier.height(with(density) { engineState.reservePx.toDp() }))
+                    }
+                }
+            }
+        }
+
+        repeat(16) {
+            composeRule.mainClock.advanceTimeByFrame()
+            composeRule.waitForIdle()
+        }
+
+        composeRule.runOnIdle {
+            assertEquals(TopAnchorPhase.Retained, engineState.runtime.phase)
+            assertTrue(engineState.reservePx > 0)
+        }
+    }
+
+    @Test
+    fun `terminal turn with zero reserve does not trigger a bottom scroll`() {
+        composeRule.mainClock.autoAdvance = false
+        val turn = TopAnchorTurn("u1", "a1", "s1", 1L)
+        val items = listOf(
+            HarnessItem("u1", 80.dp),
+            HarnessItem("a1", 720.dp),
+        )
+        lateinit var engineState: TopAnchorReserveEngineState
+
+        composeRule.setContent {
+            val density = LocalDensity.current
+            val listState = rememberLazyListState()
+            engineState = remember {
+                TopAnchorReserveEngineState().also {
+                    it.updateRuntime(
+                        TopAnchorRuntimeState(
+                            phase = TopAnchorPhase.AnchoredRunning,
+                            activeTurn = turn,
+                            reservePx = 0,
+                        )
+                    )
+                }
+            }
+
+            RunTopAnchorReserveEngine(
+                state = engineState,
+                listState = listState,
+                anchorIndex = 0,
+                anchorKey = "u1",
+                targetAnchorY = with(density) { 96.dp.toPx().toInt() },
+                trailingRealItemIndex = items.lastIndex,
+                isRunning = false,
+                config = TopAnchorConfig(
+                    tallAnchorThresholdPx = with(density) { 240.dp.toPx().toInt() },
+                    tallAnchorVisibleHeightPx = with(density) { 96.dp.toPx().toInt() },
+                    topInsetPx = with(density) { 96.dp.toPx().toInt() },
+                    stableWindowNanos = 1_000_000L,
+                    keepReserveAfterRunEnd = true,
+                ),
+                enabled = engineState.runtime.hasRuntime,
+                hasResponseTarget = true,
+            )
+
+            LazyColumn(state = listState, modifier = Modifier.height(640.dp)) {
+                itemsIndexed(items, key = { _, item -> item.id }) { _, item ->
+                    Box(Modifier.height(item.heightDp))
+                }
+            }
+        }
+
+        repeat(8) {
+            composeRule.mainClock.advanceTimeByFrame()
+            composeRule.waitForIdle()
+        }
+
+        composeRule.runOnIdle {
+            assertEquals(TopAnchorPhase.Retained, engineState.runtime.phase)
+        }
+    }
+
+    @Test
+    fun `terminal content remeasure keeps retained anchor fixed`() {
+        composeRule.mainClock.autoAdvance = false
+        val turn = TopAnchorTurn("u2", "a2", "s1", 2L)
+        val initialItems = listOf(
+            HarnessItem("u1", 280.dp),
+            HarnessItem("a1", 720.dp),
+            HarnessItem("u2", 80.dp),
+            HarnessItem("a2", 80.dp)
+        )
+        lateinit var engineState: TopAnchorReserveEngineState
+        lateinit var listState: LazyListState
+        lateinit var stopRunning: () -> Unit
+        lateinit var shrinkTerminalContent: () -> Unit
+        var targetAnchorYPx = 0
+
+        composeRule.setContent {
+            val density = LocalDensity.current
+            var isRunning by remember { mutableStateOf(true) }
+            var terminalAnswerHeight by remember { mutableStateOf(80.dp) }
+            listState = rememberLazyListState()
+            targetAnchorYPx = with(density) { 96.dp.toPx().toInt() }
+            val state = remember {
+                TopAnchorReserveEngineState().also {
+                    it.updateRuntime(
+                        TopAnchorRuntimeState(
+                            phase = TopAnchorPhase.InitialSnap,
+                            activeTurn = turn
+                        )
+                    )
+                }
+            }
+            engineState = state
+            stopRunning = { isRunning = false }
+            shrinkTerminalContent = { terminalAnswerHeight = 24.dp }
+
+            LazyColumn(
+                state = listState,
+                modifier = Modifier
+                    .height(640.dp)
+                    .testTag("top_anchor_list")
+            ) {
+                itemsIndexed(initialItems, key = { _, item -> item.id }) { _, item ->
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(if (item.id == "a2") terminalAnswerHeight else item.heightDp)
+                            .testTag(item.id)
+                    )
+                }
+                if (state.reservePx > 0) {
+                    item(key = "top_anchor_reserve") {
+                        Spacer(
+                            modifier = Modifier
+                                .height(with(density) { state.reservePx.toDp() })
+                                .testTag("top_anchor_reserve")
+                        )
+                    }
+                }
+            }
+
+            RunTopAnchorReserveEngine(
+                state = state,
+                listState = listState,
+                anchorIndex = 2,
+                anchorKey = "u2",
+                targetAnchorY = targetAnchorYPx,
+                trailingRealItemIndex = initialItems.lastIndex,
+                isRunning = isRunning,
+                config = TopAnchorConfig(
+                    tallAnchorThresholdPx = with(density) { 240.dp.toPx().toInt() },
+                    tallAnchorVisibleHeightPx = with(density) { 96.dp.toPx().toInt() },
+                    topInsetPx = with(density) { 96.dp.toPx().toInt() },
+                    stableWindowNanos = 1_000_000L,
+                    keepReserveAfterRunEnd = true,
+                ),
+                enabled = state.runtime.hasRuntime,
+                hasResponseTarget = true,
+            )
+        }
+
+        composeRule.mainClock.advanceTimeByFrame()
+        composeRule.waitUntil { engineState.runtime.phase == TopAnchorPhase.AnchoredRunning }
+        composeRule.runOnIdle {
+            assertTrue(engineState.reservePx > 0)
+        }
+
+        var anchorYBeforeCompletion = 0
+        composeRule.runOnIdle {
+            anchorYBeforeCompletion = listState.layoutInfo.visibleItemsInfo
+                .first { it.key == "u2" }
+                .offset - listState.layoutInfo.viewportStartOffset
+        }
+        composeRule.runOnUiThread { stopRunning() }
+        repeat(8) {
+            composeRule.mainClock.advanceTimeByFrame()
+            composeRule.waitForIdle()
+        }
+
+        composeRule.runOnIdle {
+            val anchorY = listState.layoutInfo.visibleItemsInfo
+                .first { it.key == "u2" }
+                .offset - listState.layoutInfo.viewportStartOffset
+            assertEquals(anchorYBeforeCompletion, anchorY)
+            assertEquals(TopAnchorPhase.Retained, engineState.runtime.phase)
+            assertTrue(engineState.reservePx > 0)
+            assertFalse(listState.canScrollForward)
+        }
+
+        composeRule.runOnUiThread { shrinkTerminalContent() }
+        repeat(4) {
+            composeRule.mainClock.advanceTimeByFrame()
+            composeRule.waitForIdle()
+        }
+
+        composeRule.runOnIdle {
+            val anchorY = listState.layoutInfo.visibleItemsInfo
+                .first { it.key == "u2" }
+                .offset - listState.layoutInfo.viewportStartOffset
+            assertEquals(anchorYBeforeCompletion, anchorY)
+            assertEquals(TopAnchorPhase.Retained, engineState.runtime.phase)
+            assertTrue(engineState.reservePx > 0)
+            assertFalse(listState.canScrollForward)
+        }
+    }
+
+    @Test
+    fun `last user message reaches top target before assistant item exists`() {
+        composeRule.mainClock.autoAdvance = false
+        val turn = TopAnchorTurn("u2", null, "s1", 3L)
+        val initialItems = listOf(
+            HarnessItem("u1", 280.dp),
+            HarnessItem("a1", 720.dp),
+            HarnessItem("u2", 80.dp),
+        )
+        lateinit var engineState: TopAnchorReserveEngineState
+        lateinit var listState: LazyListState
+        var targetAnchorYPx = 0
+
+        composeRule.setContent {
+            val density = LocalDensity.current
+            listState = rememberLazyListState()
+            targetAnchorYPx = with(density) { 96.dp.toPx().toInt() }
+            engineState = remember {
+                TopAnchorReserveEngineState().also {
+                    it.updateRuntime(
+                        TopAnchorRuntimeState(
+                            phase = TopAnchorPhase.InitialSnap,
+                            activeTurn = turn,
+                        )
+                    )
+                }
+            }
+
+            LazyColumn(
+                state = listState,
+                modifier = Modifier
+                    .height(640.dp)
+                    .testTag("last_user_anchor_list"),
+            ) {
+                itemsIndexed(initialItems, key = { _, item -> item.id }) { _, item ->
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(item.heightDp)
+                            .testTag(item.id)
+                    )
+                }
+                if (engineState.reservePx > 0) {
+                    item(key = "top_anchor_reserve") {
+                        Spacer(modifier = Modifier.height(with(density) { engineState.reservePx.toDp() }))
+                    }
+                }
+            }
+
+            RunTopAnchorReserveEngine(
+                state = engineState,
+                listState = listState,
+                anchorIndex = initialItems.lastIndex,
+                anchorKey = "u2",
+                targetAnchorY = targetAnchorYPx,
+                trailingRealItemIndex = initialItems.lastIndex,
+                isRunning = true,
+                config = TopAnchorConfig(
+                    tallAnchorThresholdPx = with(density) { 240.dp.toPx().toInt() },
+                    tallAnchorVisibleHeightPx = with(density) { 96.dp.toPx().toInt() },
+                    topInsetPx = targetAnchorYPx,
+                    stableWindowNanos = 1_000_000L,
+                ),
+                enabled = engineState.runtime.hasRuntime,
+            )
+        }
+
+        repeat(8) {
+            composeRule.mainClock.advanceTimeByFrame()
+            composeRule.waitForIdle()
+        }
+
+        composeRule.runOnIdle {
+            val anchor = listState.layoutInfo.visibleItemsInfo.first { it.key == "u2" }
+            val actualAnchorY = anchor.offset - listState.layoutInfo.viewportStartOffset
+            val layoutSummary = listState.layoutInfo.visibleItemsInfo.joinToString { item ->
+                "${item.key}@${item.offset}:${item.size}"
+            }
+            assertTrue(
+                "actual=$actualAnchorY target=$targetAnchorYPx reserve=${engineState.reservePx} " +
+                    "phase=${engineState.runtime.phase} viewport=${listState.layoutInfo.viewportStartOffset}.." +
+                    "${listState.layoutInfo.viewportEndOffset} total=${listState.layoutInfo.totalItemsCount} " +
+                    "items=[$layoutSummary]",
+                abs(actualAnchorY - targetAnchorYPx) <= 1,
+            )
+        }
+    }
+
+    @Test
+    fun `assistant insertion and viewport expansion do not cancel initial top anchor`() {
+        composeRule.mainClock.autoAdvance = false
+        val turn = TopAnchorTurn("u2", null, "s1", 3L)
+        val initialItems = listOf(
+            HarnessItem("u1", 280.dp),
+            HarnessItem("a1", 720.dp),
+            HarnessItem("u2", 80.dp),
+        )
+        lateinit var engineState: TopAnchorReserveEngineState
+        lateinit var listState: LazyListState
+        lateinit var insertAssistantAndExpandViewport: () -> Unit
+        var targetAnchorYPx = 0
+
+        composeRule.setContent {
+            val density = LocalDensity.current
+            var items by remember { mutableStateOf(initialItems) }
+            var viewportHeight by remember { mutableStateOf(420.dp) }
+            listState = rememberLazyListState()
+            targetAnchorYPx = with(density) { 96.dp.toPx().toInt() }
+            engineState = remember {
+                TopAnchorReserveEngineState().also {
+                    it.updateRuntime(
+                        TopAnchorRuntimeState(
+                            phase = TopAnchorPhase.InitialSnap,
+                            activeTurn = turn,
+                        )
+                    )
+                }
+            }
+            insertAssistantAndExpandViewport = {
+                items = items + HarnessItem("loading-a2", 48.dp)
+                viewportHeight = 640.dp
+            }
+
+            val anchorIndex = items.indexOfFirst { it.id == turn.anchorMessageId }
+            RunTopAnchorReserveEngine(
+                state = engineState,
+                listState = listState,
+                anchorIndex = anchorIndex,
+                anchorKey = turn.anchorMessageId,
+                targetAnchorY = targetAnchorYPx,
+                trailingRealItemIndex = items.lastIndex,
+                isRunning = true,
+                config = TopAnchorConfig(
+                    tallAnchorThresholdPx = with(density) { 240.dp.toPx().toInt() },
+                    tallAnchorVisibleHeightPx = with(density) { 96.dp.toPx().toInt() },
+                    topInsetPx = targetAnchorYPx,
+                    stableWindowNanos = 1_000_000L,
+                ),
+                enabled = engineState.runtime.hasRuntime,
+            )
+
+            LazyColumn(
+                state = listState,
+                modifier = Modifier
+                    .height(viewportHeight)
+                    .testTag("dynamic_top_anchor_list"),
+                contentPadding = PaddingValues(top = 96.dp, bottom = 80.dp),
+            ) {
+                itemsIndexed(items, key = { _, item -> item.id }) { _, item ->
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(item.heightDp)
+                            .testTag(item.id)
+                    )
+                }
+                if (engineState.reservePx > 0) {
+                    item(key = "top_anchor_reserve") {
+                        Spacer(modifier = Modifier.height(with(density) { engineState.reservePx.toDp() }))
+                    }
+                }
+            }
+        }
+
+        composeRule.mainClock.advanceTimeByFrame()
+        composeRule.runOnUiThread { insertAssistantAndExpandViewport() }
+        repeat(12) {
+            composeRule.mainClock.advanceTimeByFrame()
+            composeRule.waitForIdle()
+        }
+
+        composeRule.runOnIdle {
+            val anchor = listState.layoutInfo.visibleItemsInfo.first { it.key == "u2" }
+            val actualAnchorY = anchor.offset - listState.layoutInfo.viewportStartOffset
+            val layoutSummary = listState.layoutInfo.visibleItemsInfo.joinToString { item ->
+                "${item.key}@${item.offset}:${item.size}"
+            }
+            assertTrue(
+                "actual=$actualAnchorY target=$targetAnchorYPx reserve=${engineState.reservePx} " +
+                    "phase=${engineState.runtime.phase} viewportStart=${listState.layoutInfo.viewportStartOffset} " +
+                    "viewportEnd=${listState.layoutInfo.viewportEndOffset} before=${listState.layoutInfo.beforeContentPadding} " +
+                    "after=${listState.layoutInfo.afterContentPadding} canForward=${listState.canScrollForward} " +
+                    "total=${listState.layoutInfo.totalItemsCount} items=[$layoutSummary]",
+                abs(actualAnchorY - targetAnchorYPx) <= 1,
+            )
+        }
+    }
+
+    @Test
+    fun `direct send anchors before assistant pair exists`() {
+        composeRule.mainClock.autoAdvance = false
+        val historyItems = listOf(
+            HarnessItem("u1", 280.dp),
+            HarnessItem("a1", 720.dp),
+        )
+        lateinit var engineState: TopAnchorReserveEngineState
+        lateinit var listState: LazyListState
+        lateinit var appendUserAndStartRun: () -> Unit
+        lateinit var appendAssistantTarget: () -> Unit
+        lateinit var finishAnswer: () -> Unit
+        lateinit var startRegeneration: () -> Unit
+        lateinit var appendRegeneratedAssistantTarget: () -> Unit
+        lateinit var pendingSentId: () -> String?
+        lateinit var activationCount: () -> Int
+        var targetAnchorYPx = 0
+
+        composeRule.setContent {
+            val density = LocalDensity.current
+            var items by remember { mutableStateOf(historyItems) }
+            var sentUserMessageId by remember { mutableStateOf<String?>(null) }
+            var isRunning by remember { mutableStateOf(false) }
+            var activations by remember { mutableStateOf(0) }
+            listState = rememberLazyListState()
+            targetAnchorYPx = with(density) { 96.dp.toPx().toInt() }
+            engineState = remember { TopAnchorReserveEngineState() }
+            pendingSentId = { sentUserMessageId }
+            appendUserAndStartRun = {
+                items = items + HarnessItem("u2", 80.dp)
+                sentUserMessageId = "u2"
+            }
+            appendAssistantTarget = {
+                items = items + HarnessItem("loading-a2", 48.dp)
+                isRunning = true
+            }
+            finishAnswer = { isRunning = false }
+            startRegeneration = {
+                items = items.filterNot { it.id == "loading-a2" }
+                sentUserMessageId = "u2"
+                isRunning = false
+            }
+            appendRegeneratedAssistantTarget = {
+                items = items + HarnessItem("loading-a2-rerun", 48.dp)
+                isRunning = true
+            }
+            activationCount = { activations }
+
+            val topAnchorItems = items.map { item ->
+                TopAnchorItem(
+                    id = item.id,
+                    role = when {
+                        item.id.startsWith("u") -> TopAnchorItemRole.User
+                        item.id.startsWith("loading") -> TopAnchorItemRole.LoadingTarget
+                        else -> TopAnchorItemRole.AssistantTarget
+                    },
+                )
+            }
+            val activeTurn = resolveActiveTopAnchorTurn(
+                items = topAnchorItems,
+                sentUserMessageId = sentUserMessageId,
+                sessionKey = "s1",
+                generation = items.size.toLong(),
+            )
+            LaunchedEffect(
+                activeTurn?.anchorMessageId,
+                activeTurn?.targetItemId,
+                activeTurn?.generation,
+            ) {
+                val turn = activeTurn ?: return@LaunchedEffect
+                activations += 1
+                engineState.activateTurn(turn)
+                sentUserMessageId = null
+            }
+
+            val engineTurn = engineState.runtime.currentTurn
+            val responseTargetId = remember(topAnchorItems, engineTurn?.anchorMessageId) {
+                engineTurn?.let { turn ->
+                    resolveTopAnchorResponseTargetId(topAnchorItems, turn.anchorMessageId)
+                }
+            }
+            LaunchedEffect(engineTurn?.anchorMessageId, responseTargetId) {
+                val turn = engineTurn ?: return@LaunchedEffect
+                val targetId = responseTargetId ?: return@LaunchedEffect
+                engineState.attachResponseTarget(turn, targetId)
+            }
+            val engineAnchorInfo = remember(items, engineTurn) {
+                val currentTurn = engineTurn ?: return@remember null
+                items.mapIndexedNotNull { index, item ->
+                    if (item.id == currentTurn.anchorMessageId) index to item.id else null
+                }.firstOrNull()
+            }
+            LaunchedEffect(engineTurn, engineAnchorInfo) {
+                if (
+                    engineTurn != null &&
+                    engineAnchorInfo == null &&
+                    engineState.runtime.currentTurn == engineTurn
+                ) {
+                    engineState.clearRuntime()
+                }
+            }
+            engineAnchorInfo?.let { (anchorIndex, anchorKey) ->
+                RunTopAnchorReserveEngine(
+                    state = engineState,
+                    listState = listState,
+                    anchorIndex = anchorIndex,
+                    anchorKey = anchorKey,
+                    targetAnchorY = targetAnchorYPx,
+                    trailingRealItemIndex = items.lastIndex,
+                    isRunning = isRunning,
+                    config = TopAnchorConfig(
+                        tallAnchorThresholdPx = with(density) { 240.dp.toPx().toInt() },
+                        tallAnchorVisibleHeightPx = with(density) { 96.dp.toPx().toInt() },
+                        topInsetPx = targetAnchorYPx,
+                        stableWindowNanos = 1_000_000L,
+                        keepReserveAfterRunEnd = true,
+                        reserveInsideTrailingItem = true,
+                    ),
+                    enabled = engineState.runtime.hasRuntime,
+                    hasResponseTarget = responseTargetId != null,
+                )
+            }
+
+            LazyColumn(
+                state = listState,
+                modifier = Modifier.height(420.dp),
+                contentPadding = PaddingValues(top = 96.dp, bottom = 80.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                itemsIndexed(items, key = { _, item -> item.id }) { index, item ->
+                    Box(
+                        Modifier
+                            .appendTopAnchorReserve(
+                                if (index == items.lastIndex) engineState.reservePx else 0
+                            )
+                            .height(item.heightDp)
+                    )
+                }
+            }
+        }
+
+        composeRule.mainClock.advanceTimeByFrame()
+        composeRule.runOnUiThread { appendUserAndStartRun() }
+        repeat(12) {
+            composeRule.mainClock.advanceTimeByFrame()
+            composeRule.waitForIdle()
+        }
+        var firstGeneration = 0L
+        composeRule.runOnIdle {
+            assertEquals(null, pendingSentId())
+            assertEquals("u2", engineState.runtime.currentTurn?.anchorMessageId)
+            assertEquals(null, engineState.runtime.currentTurn?.targetItemId)
+            firstGeneration = engineState.runtime.currentTurn?.generation ?: 0L
+            assertTrue(firstGeneration > 0L)
+            val anchor = listState.layoutInfo.visibleItemsInfo.first { it.key == "u2" }
+            val actualAnchorY = anchor.offset - listState.layoutInfo.viewportStartOffset
+            assertTrue(abs(actualAnchorY - targetAnchorYPx) <= 1)
+            assertEquals(1, activationCount())
+        }
+
+        composeRule.runOnUiThread { appendAssistantTarget() }
+        repeat(12) {
+            composeRule.mainClock.advanceTimeByFrame()
+            composeRule.waitForIdle()
+        }
+        var directAnchorBeforeFinish = 0
+        composeRule.runOnIdle {
+            assertEquals(null, pendingSentId())
+            assertEquals("u2", engineState.runtime.currentTurn?.anchorMessageId)
+            assertEquals("loading-a2", engineState.runtime.currentTurn?.targetItemId)
+            assertEquals(TopAnchorPhase.AnchoredRunning, engineState.runtime.phase)
+            directAnchorBeforeFinish = listState.layoutInfo.visibleItemsInfo
+                .first { it.key == "u2" }
+                .offset - listState.layoutInfo.viewportStartOffset
+            finishAnswer()
+        }
+        repeat(8) {
+            composeRule.mainClock.advanceTimeByFrame()
+            composeRule.waitForIdle()
+        }
+        var directAnchorBeforeRegeneration = 0
+        composeRule.runOnIdle {
+            val anchorY = listState.layoutInfo.visibleItemsInfo
+                .first { it.key == "u2" }
+                .offset - listState.layoutInfo.viewportStartOffset
+            assertEquals(directAnchorBeforeFinish, anchorY)
+            assertEquals(TopAnchorPhase.Retained, engineState.runtime.phase)
+            assertTrue(engineState.reservePx > 0)
+            assertFalse(listState.canScrollForward)
+            directAnchorBeforeRegeneration = anchorY
+            startRegeneration()
+        }
+
+        repeat(12) {
+            composeRule.mainClock.advanceTimeByFrame()
+            composeRule.waitForIdle()
+        }
+        composeRule.runOnIdle {
+            assertEquals(null, pendingSentId())
+            assertEquals(2, activationCount())
+            assertEquals("u2", engineState.runtime.currentTurn?.anchorMessageId)
+            assertEquals(null, engineState.runtime.currentTurn?.targetItemId)
+            assertTrue((engineState.runtime.currentTurn?.generation ?: 0L) > firstGeneration)
+            assertEquals(TopAnchorPhase.AnchoredRunning, engineState.runtime.phase)
+            val anchorY = listState.layoutInfo.visibleItemsInfo
+                .first { it.key == "u2" }
+                .offset - listState.layoutInfo.viewportStartOffset
+            assertTrue(abs(anchorY - directAnchorBeforeRegeneration) <= 1)
+            assertTrue(engineState.reservePx > 0)
+            appendRegeneratedAssistantTarget()
+        }
+
+        repeat(12) {
+            composeRule.mainClock.advanceTimeByFrame()
+            composeRule.waitForIdle()
+        }
+        var regeneratedAnchorBeforeFinish = 0
+        composeRule.runOnIdle {
+            assertEquals(null, pendingSentId())
+            assertEquals("u2", engineState.runtime.currentTurn?.anchorMessageId)
+            assertEquals("loading-a2-rerun", engineState.runtime.currentTurn?.targetItemId)
+            val anchor = listState.layoutInfo.visibleItemsInfo.first { it.key == "u2" }
+            val actualAnchorY = anchor.offset - listState.layoutInfo.viewportStartOffset
+            assertTrue(abs(actualAnchorY - targetAnchorYPx) <= 1)
+            assertEquals(2, activationCount())
+            regeneratedAnchorBeforeFinish = actualAnchorY
+            finishAnswer()
+        }
+        repeat(8) {
+            composeRule.mainClock.advanceTimeByFrame()
+            composeRule.waitForIdle()
+        }
+        composeRule.runOnIdle {
+            val anchorY = listState.layoutInfo.visibleItemsInfo
+                .first { it.key == "u2" }
+                .offset - listState.layoutInfo.viewportStartOffset
+            assertEquals(regeneratedAnchorBeforeFinish, anchorY)
+            assertEquals(TopAnchorPhase.Retained, engineState.runtime.phase)
+            assertTrue(engineState.reservePx > 0)
+            assertFalse(listState.canScrollForward)
+        }
+    }
+
+}

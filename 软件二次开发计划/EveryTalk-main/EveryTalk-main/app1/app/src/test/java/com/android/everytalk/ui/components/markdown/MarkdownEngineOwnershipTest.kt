@@ -1,0 +1,486 @@
+package com.android.everytalk.ui.components.markdown
+
+import androidx.compose.ui.unit.dp
+import com.mikepenz.markdown.model.State
+import com.mikepenz.markdown.model.parseMarkdown
+import org.intellij.markdown.MarkdownElementTypes
+import org.intellij.markdown.MarkdownTokenTypes
+import org.intellij.markdown.flavours.gfm.GFMElementTypes
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
+import org.junit.Test
+import java.io.File
+
+class MarkdownEngineOwnershipTest {
+
+    @Test
+    fun `AI正文选择依赖原生焦点交接且输入框失焦不触发列表跳动`() {
+        val rendererSource = mainSource(
+            "com/android/everytalk/ui/components/markdown/MikePenzMarkdownRenderer.kt"
+        )
+        val inputSource = mainSource(
+            "com/android/everytalk/ui/screens/MainScreen/chat/text/ui/ChatInputArea.kt"
+        )
+        val imageInputSource = mainSource(
+            "com/android/everytalk/ui/screens/ImageGeneration/ImageGenerationInputArea.kt"
+        )
+
+        assertFalse(rendererSource.contains("clearFocus(force = true)"))
+        assertTrue(rendererSource.contains("SelectionContainer { markdownContent() }"))
+        assertTrue(inputSource.contains("if (focusState.isFocused) onFocusChange(true)"))
+        assertFalse(inputSource.contains("if (!focusState.isFocused) onFocusChange(false)"))
+        assertFalse(inputSource.contains("if (localText.isNotEmpty() && !isFocused)"))
+        assertFalse(imageInputSource.contains("if (localText.isNotEmpty() && !isFocused)"))
+    }
+
+    @Test
+    fun `唯一Markdown入口委托给MikePenz`() {
+        val source = mainSource(
+            "com/android/everytalk/ui/components/streaming/StreamBlocksRenderer.kt"
+        )
+
+        assertTrue(source.contains("fun UnifiedMarkdownRenderer("))
+        assertTrue(source.contains("preparedMessage: PreparedMessage"))
+        assertTrue(source.contains("MikePenzMarkdownRenderer("))
+        assertFalse(source.contains("parseNativeStreamingMarkdownBlocks("))
+        assertFalse(source.contains("NativeMarkdownBlocksSegment("))
+    }
+
+    @Test
+    fun `历史完成态Markdown分块继续复用MikePenz原生组件环境`() {
+        val entry = mainSource(
+            "com/android/everytalk/ui/components/streaming/StreamBlocksRenderer.kt"
+        )
+        val adapter = mainSources(
+            "com/android/everytalk/ui/components/markdown/MikePenzMarkdownRenderer.kt",
+            "com/android/everytalk/ui/components/markdown/MarkdownRendererNodes.kt",
+            "com/android/everytalk/ui/components/markdown/MarkdownLinkImages.kt",
+            "com/android/everytalk/ui/components/markdown/MarkdownRendererConstants.kt",
+            "com/android/everytalk/ui/components/markdown/MarkdownStreamingState.kt",
+        )
+
+        assertTrue(entry.contains("fun UnifiedMarkdownNodesRenderer("))
+        assertTrue(entry.contains("preparedMarkdownDocument: PreparedMarkdownDocument"))
+        assertTrue(adapter.contains("fun MikePenzMarkdownNodesRenderer("))
+        assertTrue(adapter.contains("nodes.forEachIndexed { index, node ->"))
+        assertTrue(adapter.contains("MarkdownElement("))
+        assertTrue(adapter.contains("node = node"))
+        assertTrue(adapter.contains("components = components"))
+        assertTrue(adapter.contains("content = state.content"))
+    }
+
+    @Test
+    fun `Markdown水平线由自身统一控制对称间距`() {
+        val renderer = mainSources(
+            "com/android/everytalk/ui/components/markdown/MikePenzMarkdownRenderer.kt",
+            "com/android/everytalk/ui/components/markdown/MarkdownRendererNodes.kt",
+        )
+        val style = mainSource(
+            "com/android/everytalk/ui/components/markdown/ChatMarkdownTextStyle.kt"
+        )
+
+        assertTrue(renderer.contains("nodeType == MarkdownTokenTypes.HORIZONTAL_RULE"))
+        assertTrue(renderer.contains("hasHorizontalRuleNeighbor(nodes, index"))
+        assertTrue(renderer.contains("contextNodes = preparedMarkdownDocument.nodes"))
+        assertTrue(renderer.contains("firstNodeIndex = selectedNodeStartIndex"))
+        assertTrue(renderer.contains("MarkdownStreamingNodesSuccess("))
+        assertTrue(renderer.contains("top = LocalMarkdownHorizontalRuleTopPadding.current"))
+        assertTrue(renderer.contains("bottom = ChatMarkdownTextStyle.HORIZONTAL_RULE_VERTICAL_PADDING_DP.dp"))
+        assertTrue(style.contains("HORIZONTAL_RULE_VERTICAL_PADDING_DP = 24f"))
+    }
+
+    @Test
+    fun `表格后水平线在流式与完成态都不叠加空行间距`() {
+        val state = parseMarkdown(
+            """
+            | 维度 | EASICOIN |
+            | :--- | :--- |
+            | 额外激励 | 无 |
+
+            ---
+
+            ### 二、相比 Plasma One，EASICOIN 的优势
+            """.trimIndent(),
+            lookupLinks = false,
+            flavour = EveryTalkMarkdownFlavourDescriptor,
+        ) as State.Success
+        val nodes = state.node.children
+        val tableIndex = nodes.indexOfFirst { it.type == GFMElementTypes.TABLE }
+        val horizontalRuleIndex = nodes.indexOfFirst {
+            it.type == MarkdownTokenTypes.HORIZONTAL_RULE
+        }
+        val headingIndex = nodes.indexOfFirst { it.type == MarkdownElementTypes.ATX_3 }
+
+        assertTrue(tableIndex >= 0)
+        assertTrue(horizontalRuleIndex > tableIndex)
+        assertTrue(headingIndex > horizontalRuleIndex)
+        (tableIndex + 1..headingIndex).forEach { index ->
+            if (
+                nodes[index].type == MarkdownTokenTypes.EOL ||
+                nodes[index].type == MarkdownTokenTypes.HORIZONTAL_RULE ||
+                index == headingIndex
+            ) {
+                assertFalse(shouldIncludeMarkdownNodeSpacer(nodes, index))
+            }
+        }
+    }
+
+    @Test
+    fun `Markdown水平线相邻空行不再叠加块间距`() {
+        val state = parseMarkdown("段落\n\n---\n\n## 标题", lookupLinks = false) as State.Success
+        val nodes = state.node.children
+        val paragraphIndex = nodes.indexOfFirst { it.type == MarkdownElementTypes.PARAGRAPH }
+        val horizontalRuleIndex = nodes.indexOfFirst { it.type == MarkdownTokenTypes.HORIZONTAL_RULE }
+        val headingIndex = nodes.indexOfFirst { it.type == MarkdownElementTypes.ATX_2 }
+
+        assertTrue(shouldIncludeMarkdownNodeSpacer(nodes, paragraphIndex))
+        assertFalse(shouldIncludeMarkdownNodeSpacer(nodes, horizontalRuleIndex))
+        nodes.indices
+            .filter { nodes[it].type == MarkdownTokenTypes.EOL }
+            .forEach { assertFalse(shouldIncludeMarkdownNodeSpacer(nodes, it)) }
+        assertFalse(shouldIncludeMarkdownNodeSpacer(nodes, headingIndex))
+
+        val horizontalRuleBlock = listOf(nodes[horizontalRuleIndex])
+        assertEquals(
+            horizontalRuleIndex,
+            markdownNodeStartIndex(nodes, horizontalRuleBlock),
+        )
+        assertFalse(
+            shouldIncludeMarkdownNodeSpacer(
+                nodes,
+                markdownNodeStartIndex(nodes, horizontalRuleBlock),
+            )
+        )
+    }
+
+    @Test
+    fun `连续空行不再重复产生段落间距`() {
+        val state = parseMarkdown("第一段\n\n\n第二段", lookupLinks = false) as State.Success
+        val nodes = state.node.children
+        val paragraphIndices = nodes.indices.filter {
+            nodes[it].type == MarkdownElementTypes.PARAGRAPH
+        }
+
+        assertEquals(2, paragraphIndices.size)
+        paragraphIndices.forEach { assertTrue(shouldIncludeMarkdownNodeSpacer(nodes, it)) }
+        nodes.indices
+            .filter { nodes[it].type == MarkdownTokenTypes.EOL }
+            .forEach { assertFalse(shouldIncludeMarkdownNodeSpacer(nodes, it)) }
+    }
+
+    @Test
+    fun `仅后续独占加粗小标题增加额外顶部间距`() {
+        val state = parseMarkdown(
+            "**1. 第一项**\n\n第一段正文。\n\n**2. 第二项**\n\n第二段正文。",
+            lookupLinks = false,
+            flavour = EveryTalkMarkdownFlavourDescriptor,
+        ) as State.Success
+        val nodes = state.node.children
+        val paragraphIndices = nodes.indices.filter {
+            nodes[it].type == MarkdownElementTypes.PARAGRAPH
+        }
+
+        assertEquals(4, paragraphIndices.size)
+        assertEquals(0.dp, standaloneStrongSectionExtraTopSpacing(nodes, paragraphIndices[0]))
+        assertEquals(0.dp, standaloneStrongSectionExtraTopSpacing(nodes, paragraphIndices[1]))
+        assertEquals(8.dp, standaloneStrongSectionExtraTopSpacing(nodes, paragraphIndices[2]))
+        assertEquals(0.dp, standaloneStrongSectionExtraTopSpacing(nodes, paragraphIndices[3]))
+    }
+
+    @Test
+    fun `生产消息入口只调用统一Markdown入口`() {
+        val entryPoints = listOf(
+            "com/android/everytalk/ui/screens/MainScreen/chat/text/ui/ChatMessagesList.kt",
+            "com/android/everytalk/ui/screens/ImageGeneration/ImageGenerationMessagesList.kt",
+            "com/android/everytalk/ui/screens/BubbleMain/Main/BubbleContentTypes.kt",
+            "com/android/everytalk/ui/screens/BubbleMain/Main/ThinkingUI.kt",
+        )
+
+        entryPoints.forEach { path ->
+            val source = if (path.endsWith("ChatMessagesList.kt")) {
+                mainSources(
+                    path,
+                    "com/android/everytalk/ui/screens/MainScreen/chat/text/ui/ChatAiMessageComponents.kt",
+                )
+            } else if (path.endsWith("ImageGenerationMessagesList.kt")) {
+                mainSources(
+                    path,
+                    "com/android/everytalk/ui/screens/ImageGeneration/ImageGenerationMessagesListContent.kt",
+                    "com/android/everytalk/ui/screens/ImageGeneration/ImageGenerationAiMessageItem.kt",
+                )
+            } else {
+                mainSource(path)
+            }
+            assertTrue(path, source.contains("UnifiedMarkdownRenderer("))
+            assertFalse(path, source.contains("MikePenzMarkdownRenderer("))
+        }
+    }
+
+    @Test
+    fun `项目依赖中没有Markwon和JLatexMath`() {
+        val buildFile = projectFile("app/build.gradle.kts").readText(Charsets.UTF_8)
+
+        assertTrue(buildFile.contains("libs.mikepenz.markdown.core"))
+        assertTrue(buildFile.contains("libs.mikepenz.markdown.m3"))
+        assertTrue(buildFile.contains("libs.mikepenz.markdown.coil3"))
+        assertFalse(buildFile.contains("io.noties.markwon"))
+        assertFalse(buildFile.contains("jlatexmath"))
+    }
+
+    @Test
+    fun `数学公式由本地MathJax转SVG并由Compose绘制`() {
+        val adapter = mainSources(
+            "com/android/everytalk/ui/components/markdown/MikePenzMarkdownRenderer.kt",
+            "com/android/everytalk/ui/components/markdown/MarkdownRendererNodes.kt",
+            "com/android/everytalk/ui/components/markdown/MarkdownLinkImages.kt",
+            "com/android/everytalk/ui/components/markdown/MarkdownRendererConstants.kt",
+            "com/android/everytalk/ui/components/markdown/MarkdownStreamingState.kt",
+        )
+        val mathRenderer = mainSource(
+            "com/android/everytalk/ui/components/math/MathRenderer.kt"
+        )
+        val mathJaxRuntime = mainSource(
+            "com/android/everytalk/ui/components/math/MathJaxSvgRenderer.kt"
+        )
+
+        assertTrue(adapter.contains("MathInline("))
+        assertTrue(adapter.contains("MathBlock("))
+        assertTrue(adapter.contains("MarkdownInlineContent") || adapter.contains("markdownInlineContent"))
+        assertTrue(adapter.contains("markdownAnnotator"))
+        assertTrue(adapter.contains("appendInlineContent(link, inlineFormulaAlternateText(formula))"))
+        assertTrue(adapter.contains("metrics.widthEm.em"))
+        assertTrue(mathRenderer.contains("AsyncImage("))
+        assertTrue(mathRenderer.contains("MathJaxRenderResult"))
+        assertTrue(mathRenderer.contains("catch (_: TimeoutCancellationException)"))
+        assertTrue(mathRenderer.contains("withContext(Dispatchers.Default)"))
+        assertTrue(mathJaxRuntime.contains("class MathJaxSvgRenderer("))
+        assertTrue(mathJaxRuntime.contains("private var webView: WebView?"))
+        assertFalse(mathRenderer.contains("androidx.compose.ui.viewinterop.AndroidView"))
+        assertFalse(mathRenderer.contains("import android.webkit.WebView"))
+        assertFalse(mathRenderer.contains("katex", ignoreCase = true))
+        assertFalse(adapter.contains("Base64"))
+        assertFalse(adapter.contains("StableLatexRenderer("))
+    }
+
+    @Test
+    fun `Markdown标准组件使用MikePenz并集中配置移动端视觉层级`() {
+        val adapter = mainSources(
+            "com/android/everytalk/ui/components/markdown/MikePenzMarkdownRenderer.kt",
+            "com/android/everytalk/ui/components/markdown/MarkdownRendererNodes.kt",
+            "com/android/everytalk/ui/components/markdown/MarkdownLinkImages.kt",
+            "com/android/everytalk/ui/components/markdown/MarkdownRendererConstants.kt",
+            "com/android/everytalk/ui/components/markdown/MarkdownStreamingState.kt",
+        )
+
+        assertTrue(adapter.contains("val markdownColors = markdownColor("))
+        assertTrue(adapter.contains("inlineCodeBackground = Color.Transparent"))
+        assertTrue(adapter.contains("val bodyStyle = MaterialTheme.typography.bodyLarge.copy("))
+        assertTrue(adapter.contains("fontSize = ChatMarkdownTextStyle.BODY_FONT_SIZE_SP.sp"))
+        assertTrue(adapter.contains("lineHeight = ChatMarkdownTextStyle.BODY_LINE_HEIGHT_SP.sp"))
+        assertTrue(adapter.contains("h1 = bodyStyle.copy("))
+        assertTrue(adapter.contains("fontSize = ChatMarkdownTextStyle.headingFontSizeSp(1).sp"))
+        assertTrue(adapter.contains("h3 = bodyStyle.copy("))
+        assertTrue(adapter.contains("fontSize = ChatMarkdownTextStyle.headingFontSizeSp(3).sp"))
+        val headingTypography = adapter
+            .substringAfter("h1 = bodyStyle.copy(")
+            .substringBefore("text = bodyStyle")
+        assertEquals(6, headingTypography.split("fontWeight = FontWeight.Normal").size - 1)
+        assertFalse(headingTypography.contains("fontWeight = FontWeight.Medium"))
+        assertTrue(adapter.contains("inlineCode = bodyStyle.copy("))
+        assertTrue(adapter.contains("fontSize = 13.sp"))
+        assertTrue(adapter.contains("fontFamily = FontFamily.Monospace"))
+        assertTrue(adapter.contains("MARKDOWN_LINK_LIGHT_COLOR = Color(0xFF66B5FF)"))
+        assertTrue(adapter.contains("MARKDOWN_LINK_DARK_COLOR = Color(0xFF66B5FF)"))
+        assertTrue(adapter.contains("val markdownLinkColor = if (MaterialTheme.colorScheme.background.luminance() < 0.5f)"))
+        assertTrue(adapter.contains("color = markdownLinkColor"))
+        assertTrue(adapter.contains("textDecoration = TextDecoration.None"))
+        assertTrue(adapter.contains("markdownLinkLogoRequests("))
+        assertTrue(adapter.contains("markdownLinkLogoInlineContent("))
+        assertTrue(adapter.contains("createPreparedMessageMarkdownAnnotator("))
+        assertTrue(adapter.contains("linkFaviconUrl("))
+        assertTrue(adapter.contains("val padding = markdownPadding("))
+        assertTrue(adapter.contains("block = ChatMarkdownTextStyle.SPACING_PARAGRAPH_DP.dp"))
+        assertTrue(adapter.contains("list = ChatMarkdownTextStyle.LIST_EDGE_SPACING_DP.dp"))
+        assertTrue(adapter.contains("listItemTop = ChatMarkdownTextStyle.LIST_ITEM_TOP_SPACING_DP.dp"))
+        assertTrue(adapter.contains("listItemBottom = ChatMarkdownTextStyle.LIST_ITEM_BOTTOM_SPACING_DP.dp"))
+        assertTrue(adapter.contains("listIndent = ChatMarkdownTextStyle.LIST_NESTED_INDENT_DP.dp"))
+        assertTrue(adapter.contains("EveryTalkMarkdownOrderedList(model)"))
+        assertTrue(adapter.contains("EveryTalkMarkdownUnorderedList(model)"))
+        assertTrue(adapter.contains("MarkdownOrderedList("))
+        assertTrue(adapter.contains("MarkdownListItems("))
+        assertEquals(2, adapter.split(".requiredWidth(ChatMarkdownTextStyle.LIST_MARKER_WIDTH_DP.dp)").size - 1)
+        assertEquals(1, adapter.split(".wrapContentWidth(Alignment.End)").size - 1)
+        assertEquals(
+            2,
+            adapter.split("listModifier = { Modifier.weight(1f) }").size - 1,
+        )
+        assertFalse(adapter.contains("listNestedAlignmentOffsetDp"))
+        assertFalse(adapter.contains("offset(x ="))
+        assertTrue(adapter.contains("EveryTalkMarkdownListMarker("))
+        assertTrue(adapter.contains("Canvas("))
+        assertTrue(adapter.contains("ChatMarkdownTextStyle.LIST_MARKER_OPTICAL_HEIGHT_SP.sp.toDp()"))
+        assertFalse(adapter.contains("LIST_MARKER_VERTICAL_CENTER_OFFSET_SP"))
+        assertFalse(adapter.contains(".offset(y ="))
+        assertTrue(adapter.contains(".testTag(\"markdown-list-marker-${'$'}{level.coerceAtLeast(0)}\")"))
+        assertFalse(adapter.contains("LocalBulletListHandler"))
+        assertTrue(adapter.contains("markdownExtendedSpansWithRegularStrongWeight()"))
+        assertEquals(3, adapter.split("extendedSpans = markdownExtendedSpans").size - 1)
+        assertTrue(adapter.contains("markdownAnnotatorSettingsWithRegularStrongWeight("))
+        val style = mainSource(
+            "com/android/everytalk/ui/components/markdown/ChatMarkdownTextStyle.kt"
+        )
+        assertTrue(style.contains("BODY_FONT_SIZE_SP = 16f"))
+        assertTrue(style.contains("BODY_LINE_HEIGHT_SP = 26f"))
+        assertTrue(style.contains("ASSISTANT_CONTENT_END_PADDING_DP = 12f"))
+        assertTrue(style.contains("1 -> 22f"))
+        assertTrue(style.contains("3 -> 18f"))
+        assertTrue(style.contains("LIST_MARKER_WIDTH_DP = 24f"))
+        assertTrue(style.contains("LIST_CIRCLE_DIAMETER_DP = 6f"))
+        assertTrue(style.contains("LIST_HOLLOW_CIRCLE_STROKE_DP = 1f"))
+        assertTrue(style.contains("LIST_TRIANGLE_WIDTH_DP = 7f"))
+        assertTrue(style.contains("LIST_TRIANGLE_HEIGHT_DP = 7f"))
+        assertFalse(style.contains("LIST_MARKER_VERTICAL_CENTER_OFFSET_SP"))
+        assertTrue(style.contains("LIST_NESTED_INDENT_DP = 0f"))
+        assertTrue(style.contains("LIST_EDGE_SPACING_DP = 8f"))
+        assertTrue(style.contains("LIST_ITEM_TOP_SPACING_DP = 10f"))
+        assertTrue(style.contains("LIST_ITEM_BOTTOM_SPACING_DP = 10f"))
+        assertTrue(style.contains("SPACING_PARAGRAPH_DP = 16f"))
+        val summaryTypography = adapter
+            .substringAfter("val summaryStyle = currentBodyStyle.value.copy(")
+            .substringBefore("val summaryAnnotatorSettings")
+        assertTrue(summaryTypography.contains("fontWeight = FontWeight.Normal"))
+        assertFalse(summaryTypography.contains("fontWeight = FontWeight.Medium"))
+        assertTrue(adapter.contains("annotator = currentAnnotator.value"))
+        assertTrue(adapter.contains("annotator = annotator"))
+        assertTrue(adapter.contains("typography = typography"))
+        assertTrue(adapter.contains("padding = padding"))
+        assertTrue(adapter.contains("retainState = true"))
+        assertTrue(adapter.contains("CodeBlockCard("))
+        assertTrue(adapter.contains("MarkdownHeader("))
+        assertTrue(adapter.contains("MarkdownParagraph("))
+        assertTrue(adapter.contains("EveryTalkMarkdownTable("))
+        assertTrue(adapter.contains("MarkdownTableHeader("))
+        assertTrue(adapter.contains("MarkdownTableRow("))
+        assertTrue(adapter.contains("maxLines = Int.MAX_VALUE"))
+        assertTrue(adapter.contains("overflow = TextOverflow.Clip"))
+        assertTrue(adapter.contains("tableBackground = Color.Transparent"))
+        assertTrue(adapter.contains("markdownTableEdgeVisibility("))
+        assertTrue(adapter.contains("bodyFootnoteFallbackTargets"))
+        assertTrue(adapter.contains("fallbackTargetUris = bodyFootnoteFallbackTargets"))
+        assertTrue(adapter.contains("imageTransformer = EveryTalkMarkdownImageTransformer"))
+        assertTrue(adapter.contains("ImageTransformer by Coil3ImageTransformerImpl"))
+        assertTrue(adapter.contains("MarkdownInlineImageWithFailure("))
+        assertTrue(adapter.contains("currentImageClickCallback.value"))
+        assertTrue(adapter.contains(".markdownImageClick(model.content, onImageClick)"))
+        assertTrue(adapter.contains("MarkdownImageLoading("))
+        assertTrue(adapter.contains("stringResource(R.string.image_load_failed)"))
+        assertFalse(adapter.contains("headingStyle("))
+        assertFalse(adapter.contains("FontStyle.Italic"))
+        assertFalse(adapter.contains("image = {"))
+        assertFalse(adapter.contains("markdownDimens("))
+        assertFalse(adapter.contains("TableRenderer("))
+        assertFalse(adapter.contains("ProportionalAsyncImage("))
+        assertFalse(adapter.contains("InlineMarkdownParser"))
+        assertFalse(adapter.contains("normalizeNestedMarkdownCodeFences"))
+        assertFalse(adapter.contains("unwrapMarkdownDocumentFences"))
+        assertFalse(adapter.contains("normalizeInProgressTaskMarkers"))
+        assertFalse(adapter.contains("StreamBlockParser"))
+    }
+
+    @Test
+    fun `AI流式Markdown使用MikePenz稳定AST并可从非追加改写恢复`() {
+        val adapter = mainSources(
+            "com/android/everytalk/ui/components/markdown/MikePenzMarkdownRenderer.kt",
+            "com/android/everytalk/ui/components/markdown/MarkdownRendererNodes.kt",
+            "com/android/everytalk/ui/components/markdown/MarkdownLinkImages.kt",
+            "com/android/everytalk/ui/components/markdown/MarkdownRendererConstants.kt",
+            "com/android/everytalk/ui/components/markdown/MarkdownStreamingState.kt",
+        )
+
+        assertTrue(adapter.contains("rememberStreamingMarkdownState("))
+        assertTrue(adapter.contains("PrepareStreamingMarkdownRebase("))
+        assertTrue(adapter.contains("mutableStateOf<StreamingMarkdownBundle?>(null)"))
+        assertTrue(adapter.contains("request.result.await()"))
+        assertTrue(adapter.contains("activeBundle.value = StreamingMarkdownBundle("))
+        assertTrue(adapter.contains("visibleStreamingBundle?.preparedMessage ?: preparedMessage"))
+        assertFalse(adapter.contains("key(visibleStreamingMarkdownState)"))
+        assertTrue(adapter.contains("streamingMarkdownState = visibleStreamingMarkdownState"))
+        assertTrue(adapter.contains("MarkdownStreamingNodesSuccess("))
+        assertTrue(adapter.contains("streamingContent = visibleStreamingMarkdownState.content.toString()"))
+        assertTrue(adapter.contains("appendOnlyMarkdownDelta("))
+        assertTrue(adapter.contains("bundle.state.append(appendedDelta)"))
+        assertTrue(adapter.contains("bundle.copy(preparedMessage = nextPreparedMessage)"))
+        assertTrue(adapter.contains("retainState = true"))
+        assertFalse(adapter.contains("useStaticFallback"))
+    }
+
+    @Test
+    fun `流式Markdown只接受严格追加内容`() {
+        assertTrue(appendOnlyMarkdownDelta("", "第一段") == "第一段")
+        assertTrue(appendOnlyMarkdownDelta("第一段", "第一段\n\n第二段") == "\n\n第二段")
+        assertTrue(appendOnlyMarkdownDelta("完整内容", "完整内容") == "")
+        assertTrue(appendOnlyMarkdownDelta("原始公式 ${'$'}x", "公式占位") == null)
+        assertTrue(appendOnlyMarkdownDelta("更长内容", "短") == null)
+    }
+
+    @Test
+    fun `非追加改写重建基线后继续接受后续增量`() {
+        var appendedContent = "原始公式 ${'$'}x"
+        val rebasedContent = "公式占位"
+
+        assertTrue(appendOnlyMarkdownDelta(appendedContent, rebasedContent) == null)
+        appendedContent = rebasedContent
+
+        repeat(20) { index ->
+            val nextContent = "$appendedContent 追加$index"
+            assertTrue(appendOnlyMarkdownDelta(appendedContent, nextContent) == " 追加$index")
+            appendedContent = nextContent
+        }
+    }
+
+    @Test
+    fun `旧Markdown分块器和自定义表格解析器已删除`() {
+        val messageProcessor = mainSource(
+            "com/android/everytalk/util/messageprocessor/MessageProcessor.kt"
+        )
+
+        assertFalse(projectFileExists("app/src/main/java/com/android/everytalk/ui/components/ContentParser.kt"))
+        assertFalse(projectFileExists("app/src/main/java/com/android/everytalk/util/cache/ContentParseCache.kt"))
+        assertFalse(projectFileExists("app/src/main/java/com/android/everytalk/ui/components/table/TableUtils.kt"))
+        assertFalse(messageProcessor.contains("ContentParser"))
+        assertFalse(messageProcessor.contains("ContentPart"))
+    }
+
+    private fun mainSource(relativePath: String): String {
+        return projectFile("app/src/main/java/$relativePath").readText(Charsets.UTF_8)
+    }
+
+    private fun mainSources(vararg relativePaths: String): String =
+        relativePaths.joinToString("\n") { relativePath -> mainSource(relativePath) }
+
+    private fun projectFile(relativePath: String): File {
+        val workingDirectory = File(System.getProperty("user.dir") ?: ".").absoluteFile
+        return generateSequence(workingDirectory, File::getParentFile)
+            .flatMap { directory ->
+                sequenceOf(
+                    File(directory, relativePath),
+                    File(File(directory, "app1"), relativePath),
+                )
+            }
+            .firstOrNull(File::isFile)
+            ?: error("找不到文件：$relativePath")
+    }
+
+    private fun projectFileExists(relativePath: String): Boolean {
+        val workingDirectory = File(System.getProperty("user.dir") ?: ".").absoluteFile
+        return generateSequence(workingDirectory, File::getParentFile)
+            .flatMap { directory ->
+                sequenceOf(
+                    File(directory, relativePath),
+                    File(File(directory, "app1"), relativePath),
+                )
+            }
+            .any(File::isFile)
+    }
+}
