@@ -26,19 +26,11 @@ jobs:
         cache: gradle
 
     - name: Setup Android SDK
-      uses: android-actions/setup-android@v3
-      with:
-        api-level: 37
-        build-tools: 37.0.0
-
-    - name: Install SDK components
       run: |
-        sdkmanager "platforms;android-37" "build-tools;37.0.0"
-
-    - name: Create local.properties
-      run: |
+        echo "ANDROID_HOME=$ANDROID_HOME"
         echo "sdk.dir=$ANDROID_HOME" > local.properties
         cat local.properties
+        sdkmanager --list_installed
 
     - name: Grant execute permission for gradlew
       run: chmod +x gradlew
@@ -48,11 +40,10 @@ jobs:
 
     - name: Find APK files
       run: |
-        echo "Looking for APK files..."
-        find . -name "*.apk" -type f -ls
-        echo "Checking custom build directory:"
-        ls -la ~/.everytalk-gradle-build/ 2>/dev/null || echo "Custom build dir not found"
-        find ~/.everytalk-gradle-build -name "*.apk" -type f -ls 2>/dev/null || echo "No APKs in custom dir"
+        echo "Standard location:"
+        find . -name "*.apk" -type f 2>/dev/null || echo "Not found in standard location"
+        echo "Custom location:"
+        find ~/.everytalk-gradle-build -name "*.apk" -type f 2>/dev/null || echo "Not found in custom location"
 
     - name: Upload Debug APK
       uses: actions/upload-artifact@v4
