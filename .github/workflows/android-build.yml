@@ -1,52 +1,31 @@
-name: Android Build
+name: Android CI
 
 on:
   push:
-    branches: [main]
-    tags: ['v*']
-  pull_request:
-    branches: [main]
+    branches: [ "main" ]
   workflow_dispatch:
 
 jobs:
   build:
-    name: Build APK
     runs-on: ubuntu-latest
-    timeout-minutes: 30
 
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-    - name: Set up JDK 21
-      uses: actions/setup-java@v4
-      with:
-        java-version: '21'
-        distribution: 'temurin'
-        cache: gradle
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
 
-    - name: Create local.properties
-      run: |
-        echo "sdk.dir=$ANDROID_HOME" > local.properties
-        echo "Created local.properties:"
-        cat local.properties
+      - name: Make gradlew executable
+        run: chmod +x gradlew
 
-    - name: Grant execute permission for gradlew
-      run: chmod +x gradlew
+      - name: Build with Gradle
+        run: ./gradlew :app:assembleDebug
 
-    - name: Build Debug APK
-      run: ./gradlew :app:assembleDebug
-
-    - name: Find APK files
-      run: |
-        echo "Looking for APK files..."
-        find . -name "*.apk" -type f 2>/dev/null || echo "Not found in project"
-        find ~/.everytalk-gradle-build -name "*.apk" -type f 2>/dev/null || echo "Not found in custom location"
-
-    - name: Upload Debug APK
-      uses: actions/upload-artifact@v4
-      with:
-        name: CalistaAI-debug
-        path: |
-          **/*.apk
-          ~/.everytalk-gradle-build/**/*.apk
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-debug
+          path: "**/*.apk"
